@@ -11,9 +11,16 @@ class AgentStatus(Enum):
     """Agent lifecycle status."""
     IDLE = "idle"
     RUNNING = "running"
+    PAUSED = "paused"
     STOPPED = "stopped"
     COMPLETED = "completed"
     ERROR = "error"
+
+@dataclass
+class ForkContext:
+    """Context for forked subagents."""
+    chain_id: str
+    depth: int
 
 @dataclass
 class AgentConfig:
