@@ -5,6 +5,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Optional
 from claude_core.context.budget import TokenBudget
+from claude_core.context.compression import (
+    SnipCompact,
+    AutoCompactStrategy,
+    ReactiveCompact,
+    snip_compact_if_needed,
+    auto_compact,
+    reactive_compact,
+    SnipResult,
+    AutoCompactResult,
+)
 from claude_core.utils.tokens import count_tokens, count_tokens_for_messages
 
 @dataclass
@@ -36,10 +46,30 @@ class ContextManager:
         self._budget = TokenBudget(max_tokens=max_tokens)
         self._compact_threshold = int(max_tokens * 0.8)  # 80% threshold
 
+        # Initialize compression strategies
+        self._snip_compact = SnipCompact(threshold=50000)
+        self._auto_compact = AutoCompactStrategy(threshold=80000)
+        self._reactive_compact = ReactiveCompact()
+
     @property
     def budget(self) -> TokenBudget:
         """Get the token budget."""
         return self._budget
+
+    @property
+    def snip_compact(self) -> SnipCompact:
+        """Get the snip compact strategy."""
+        return self._snip_compact
+
+    @property
+    def auto_compact(self) -> AutoCompactStrategy:
+        """Get the auto compact strategy."""
+        return self._auto_compact
+
+    @property
+    def reactive_compact_strategy(self) -> ReactiveCompact:
+        """Get the reactive compact strategy."""
+        return self._reactive_compact
 
     async def should_compact(
         self, messages: list[Any], token_count: int
@@ -62,6 +92,10 @@ class ContextManager:
         if self._budget.is_exhausted():
             return True
 
+        # Check using snip compact strategy
+        if self._snip_compact.should_compact(messages):
+            return True
+
         return False
 
     async def compact(
@@ -71,9 +105,7 @@ class ContextManager:
         context: Any = None,
     ) -> CompactionResult:
         """
-        Perform context compaction.
-
-        Uses a simple strategy: keep recent messages and summarize older ones.
+        Perform context compaction using AutoCompact strategy.
 
         Args:
             messages: List of messages to compact
@@ -88,39 +120,81 @@ class ContextManager:
             *[{"content": str(m.message.get("content", "")) if hasattr(m, "message") else str(m)} for m in messages]
         ])
 
-        # Simple compaction: keep recent messages, summarize older
-        # Keep last N messages that fit in half the budget
-        half_budget = self._max_tokens // 2
-        recent_messages = []
-        older_messages = []
+        # Use AutoCompact strategy
+        result: AutoCompactResult = self._auto_compact.compact(
+            messages, system_prompt, context
+        )
 
-        current_count = count_tokens(system_prompt)
-        for msg in reversed(messages):
-            msg_tokens = count_tokens(str(msg.message.get("content", "")) if hasattr(msg, "message") else str(msg))
-            if current_count + msg_tokens < half_budget:
-                recent_messages.insert(0, msg)
-                current_count += msg_tokens
-            else:
-                older_messages.insert(0, msg)
-
-        # Create summary of older messages
-        summary_content = f"[Previous {len(older_messages)} messages summarized]"
-        summary_message = type('obj', (object,), {
-            "type": "user",
-            "uuid": "summary-uuid",
-            "message": {"content": summary_content}
-        })()
-
-        post_compact_count = count_tokens(system_prompt) + count_tokens(summary_content) + current_count
+        post_compact_count = pre_compact_count - result.tokens_freed
 
         return CompactionResult(
-            summary_messages=[summary_message] + recent_messages,
+            summary_messages=result.messages,
             attachments=[],
             hook_results=[],
             pre_compact_token_count=pre_compact_count,
             post_compact_token_count=post_compact_count,
             true_post_compact_token_count=post_compact_count,
-            compaction_usage=None,
+            compaction_usage={"tokens_freed": result.tokens_freed},
+        )
+
+    async def snip_compact(
+        self,
+        messages: list[Any],
+    ) -> SnipResult:
+        """
+        Perform snip compaction - removes middle messages.
+
+        Args:
+            messages: List of messages to compact
+
+        Returns:
+            SnipResult with compacted messages
+        """
+        return self._snip_compact.compact(messages)
+
+    async def reactive_compact(
+        self,
+        messages: list[Any],
+        system_prompt: str,
+        error: str,
+        context: Any = None,
+    ) -> tuple[bool, CompactionResult]:
+        """
+        Perform reactive compaction after 413 error.
+
+        Args:
+            messages: List of messages to compact
+            system_prompt: The system prompt
+            error: The error that triggered compaction
+            context: Optional context
+
+        Returns:
+            Tuple of (should_compact, CompactionResult)
+        """
+        should_compact = reactive_compact(messages, error)
+        if not should_compact:
+            return False, None
+
+        # Use reactive compact strategy for more aggressive compression
+        result: AutoCompactResult = self._reactive_compact.compact(
+            messages, system_prompt, context
+        )
+
+        pre_compact_count = count_tokens_for_messages([
+            {"content": system_prompt},
+            *[{"content": str(m.message.get("content", "")) if hasattr(m, "message") else str(m)} for m in messages]
+        ])
+
+        post_compact_count = pre_compact_count - result.tokens_freed
+
+        return True, CompactionResult(
+            summary_messages=result.messages,
+            attachments=[],
+            hook_results=[],
+            pre_compact_token_count=pre_compact_count,
+            post_compact_token_count=post_compact_count,
+            true_post_compact_token_count=post_compact_count,
+            compaction_usage={"tokens_freed": result.tokens_freed, "trigger": "reactive"},
         )
 
     def update_budget(self, prompt_tokens: int, completion_tokens: int) -> None:
