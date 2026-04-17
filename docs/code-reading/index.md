@@ -2,10 +2,17 @@
 
 本文档库提供 Claude Core SDK 的完整代码阅读指南，按模块依赖顺序组织，从入口点沿调用链逐步深入。
 
-## 模块概览
+## 核心文档
+
+| 文档 | 描述 |
+|------|------|
+| **00-code-flow.md** | 消息处理完整代码流转（推荐优先阅读） |
+| **index.md** | 模块概览和调用链关系图 |
+
+## 模块文档
 
 | 序号 | 模块 | 文件位置 | 职责 |
-|------|------|----------|------|
+|------|------|----------|-------|
 | 01 | SDK 入口 | `__init__.py` | 版本暴露，主导入点 |
 | 02 | 查询引擎 | `engine/query_engine.py` | 高级编排器，管理会话状态 |
 | 03 | 查询循环 | `engine/query_loop.py` | 核心生成器，处理流式、工具、压缩 |
@@ -113,9 +120,13 @@ override > coordinator > agent > custom > default + append
 ### 并发工具执行
 StreamingToolExecutor.validate_input() 和 check_permissions() 在工具调用前执行
 
-## 阅读顺序建议
+## 推荐阅读顺序
 
-1. **起点**：`01-sdk-entry.md` - 了解入口和主要接口
+**强烈建议从 `00-code-flow.md` 开始**，它完整追踪了一条消息从接收到响应的整个代码流转路径，包含多个 Mermaid 时序图。
+
+阅读完代码流转后，可按需深入各模块文档：
+
+1. **起点（推荐）**：`00-code-flow.md` - 完整代码流转
 2. **核心**：`02-query-engine.md` → `03-query-loop.md` - 理解编排和循环
 3. **工具**：`04-tool-system.md` → `05-builtin-tools.md` - 掌握工具执行
 4. **支撑**：`06-context.md` → `08-prompt.md` - 上下文和 Prompt 构建
