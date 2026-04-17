@@ -72,38 +72,30 @@ class QueryEngine:
         self._messages.append(user_msg)
 
         # Ensure client is initialized
-        await self._get_client()
+        client = await self._get_client()
 
-        # Prepare tools if available
-        tools = None
-        if hasattr(self, '_tools') and self._tools:
-            tools = []
-            for tool in self._tools:
-                tools.append({
-                    "type": "function",
-                    "function": {
-                        "name": tool.name,
-                        "description": tool.description,
-                        "parameters": tool.input_schema,
-                    }
-                })
+        # Build tool_use_context
+        from claude_core.models.tool import ToolUseContext, ToolUseContextOptions
 
-        # Build tool_use_context with tools if tools are available
-        tool_use_context = None
         if hasattr(self, '_tool_use_context') and self._tool_use_context:
             tool_use_context = self._tool_use_context
-            if tools:
-                tool_use_context.options.tools = tools
+            # Pass Tool objects directly to options.tools
+            if hasattr(self, '_tools') and self._tools:
+                tool_use_context.options.tools = self._tools
             tool_use_context.abort_controller = create_child_abort_controller(
                 self._abort_controller
             )
-        elif tools:
-            # Create minimal context if no context but tools provided
-            from claude_core.models.tool import ToolUseContext, ToolUseContextOptions
+        else:
+            # Create minimal context
             tool_use_context = ToolUseContext(
-                options=ToolUseContextOptions(tools=tools),
+                options=ToolUseContextOptions(
+                    tools=self._tools if hasattr(self, '_tools') else []
+                ),
                 abort_controller=create_child_abort_controller(self._abort_controller),
             )
+
+        # Store client in context so query_loop can access it
+        tool_use_context._client = client
 
         # Create query params
         params = QueryParams(
