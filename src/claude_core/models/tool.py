@@ -67,6 +67,25 @@ class ContextModifier:
     modify_context: Callable[[ToolUseContext], ToolUseContext]
 
 @dataclass
+class ToolPermissionContext:
+    """Context for tool permission checks with deny and always_allow rules."""
+    deny_rules: list[str] = field(default_factory=list)
+    always_allow_rules: list[str] = field(default_factory=list)
+    input_schema: dict[str, Any] = field(default_factory=dict)
+
+    def is_deny_rule(self, rule: str) -> bool:
+        """Check if a rule matches a deny rule."""
+        return rule in self.deny_rules
+
+    def is_always_allow_rule(self, rule: str) -> bool:
+        """Check if a rule matches an always_allow rule."""
+        return rule in self.always_allow_rules
+
+    def should_deny(self, rule: str) -> bool:
+        """Determine if a rule should be denied."""
+        return self.is_deny_rule(rule) and not self.is_always_allow_rule(rule)
+
+@dataclass
 class ToolDefinition:
     """Tool definition (interface only, actual tools are in tools/base.py)."""
     name: str

@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Protocol, Callable, Any, TYPE_CHECKING
+from typing import Protocol, Callable, Any, TYPE_CHECKING, Awaitable
 from dataclasses import dataclass
+from abc import ABC, abstractmethod
 
 if TYPE_CHECKING:
-    from claude_core.models.tool import ToolUseContext
+    from claude_core.models.tool import ToolUseContext, ToolPermissionContext
     from claude_core.models.message import Message
 
 InputSchema = Any
@@ -52,6 +53,22 @@ class Tool(Protocol):
     ) -> ToolResult:
         ...
 
+    async def validate_input(
+        self,
+        input_data: dict[str, Any],
+        context: "ToolUseContext",
+    ) -> ValidationResult:
+        """Validate tool input data."""
+        return ValidationResult(result=True)
+
+    async def check_permissions(
+        self,
+        input_data: dict[str, Any],
+        context: "ToolUseContext",
+    ) -> PermissionResult:
+        """Check if tool has permission to execute with given input."""
+        return PermissionResult(behavior="allow")
+
     def is_enabled(self) -> bool:
         return True
 
@@ -75,6 +92,22 @@ class ToolImpl:
         self.name = name
         self.description = description
         self.input_schema = input_schema
+
+    async def validate_input(
+        self,
+        input_data: dict[str, Any],
+        context: "ToolUseContext",
+    ) -> ValidationResult:
+        """Validate tool input data."""
+        return ValidationResult(result=True)
+
+    async def check_permissions(
+        self,
+        input_data: dict[str, Any],
+        context: "ToolUseContext",
+    ) -> PermissionResult:
+        """Check if tool has permission to execute with given input."""
+        return PermissionResult(behavior="allow")
 
     def is_enabled(self) -> bool:
         return True
@@ -112,10 +145,19 @@ def build_tool(tool_def: dict) -> Tool:
         tool.is_destructive = tool_def["is_destructive"]
     if "interrupt_behavior" in tool_def:
         tool.interrupt_behavior = tool_def["interrupt_behavior"]
+    if "validate_input" in tool_def:
+        tool.validate_input = tool_def["validate_input"]
+    if "check_permissions" in tool_def:
+        tool.check_permissions = tool_def["check_permissions"]
 
     # Add any additional user implementations (like 'call')
+    excluded_keys = (
+        "name", "description", "input_schema", "is_enabled", "is_concurrency_safe",
+        "is_read_only", "is_destructive", "interrupt_behavior", "validate_input",
+        "check_permissions"
+    )
     for key, value in tool_def.items():
-        if key not in ("name", "description", "input_schema", "is_enabled", "is_concurrency_safe", "is_read_only", "is_destructive", "interrupt_behavior"):
+        if key not in excluded_keys:
             setattr(tool, key, value)
 
     return tool
