@@ -47,26 +47,7 @@ asyncio.run(main())
 ```python
 import asyncio
 from claude_core import QueryEngine, QueryEngineConfig
-from claude_core.tools.base import Tool, ToolResult
-
-class ReadFileTool:
-    name = "read_file"
-    description = "读取文件内容"
-    input_schema = {
-        "type": "object",
-        "properties": {
-            "path": {"type": "string", "description": "文件路径"}
-        },
-        "required": ["path"]
-    }
-
-    async def call(self, args, context, can_use_tool, on_progress):
-        with open(args["path"]) as f:
-            content = f.read()
-        return ToolResult(
-            tool_use_id="",
-            content=content
-        )
+from claude_core.tools.builtin import create_file_read_tool, create_bash_tool
 
 async def main():
     config = QueryEngineConfig(
@@ -75,13 +56,20 @@ async def main():
     )
 
     engine = QueryEngine(config)
-    engine.set_tools([ReadFileTool()])
+
+    # 使用内置工具
+    engine.set_tools([
+        create_file_read_tool(),
+        create_bash_tool(),
+    ])
 
     async for event in engine.submit_message("帮我读取 /tmp/example.txt"):
         print(event)
 
 asyncio.run(main())
 ```
+
+内置工具包括：`FileRead`、`FileWrite`、`FileEdit`、`Glob`、`Grep`、`Bash`。
 
 ### 非流式响应（简单接口）
 
