@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import AsyncGenerator, Any, Optional
+import asyncio
+from typing import Any
 import httpx
 
 from claude_core.api.types import (
@@ -18,11 +19,12 @@ from claude_core.api.errors import (
     AuthenticationError,
     InvalidRequestError,
     APIConnectionError,
+    is_retryable_error,
 )
-from claude_core.api.streaming import StreamEvent, parse_stream_response
 
 DEFAULT_TIMEOUT = 120.0
 MAX_RETRIES = 3
+INITIAL_RETRY_DELAY = 1.0
 
 class LLMClient:
     """
@@ -58,13 +60,36 @@ class LLMClient:
             "Content-Type": "application/json",
         }
 
+    def _map_status_to_error(self, response: httpx.Response) -> APIError:
+        """Map HTTP status code to appropriate error type."""
+        status = response.status_code
+        try:
+            data = response.json()
+            error_msg = data.get("error", {}).get("message", "") or data.get("message", "Unknown error")
+        except Exception:
+            error_msg = "Unknown error"
+
+        if status == 401:
+            return AuthenticationError(error_msg)
+        elif status == 403:
+            return AuthenticationError("Access forbidden")
+        elif status == 400:
+            return InvalidRequestError(error_msg, body=response.json() if response.content else None)
+        elif status == 429:
+            retry_after = response.headers.get("retry-after")
+            return RateLimitError(error_msg, retry_after=int(retry_after) if retry_after else None)
+        elif status >= 500:
+            return APIConnectionError(f"Server error: {error_msg}")
+        else:
+            return APIError(f"HTTP {status}: {error_msg}", status_code=status)
+
     async def chat_completion(
         self,
         messages: list[MessageParam | dict],
         tools: list[ToolParam] | None = None,
         **kwargs: Any,
     ) -> ChatCompletion:
-        """Make a non-streaming chat completion request."""
+        """Make a non-streaming chat completion request with retry logic."""
         url = f"{self.base_url}/chat/completions"
         headers = self._build_headers()
 
@@ -77,27 +102,58 @@ class LLMClient:
         if tools:
             body["tools"] = [self._tool_to_dict(t) for t in tools]
 
-        response = await self._client.post(url, headers=headers, json=body)
-        data = response.json()
+        last_error: APIError | None = None
+        retry_delay = INITIAL_RETRY_DELAY
 
-        return ChatCompletion(
-            id=data.get("id", ""),
-            model=data.get("model", self.model),
-            choices=[
-                ChatCompletionChoice(
-                    index=c.get("index", 0),
-                    message=c.get("message", {}),
-                    finish_reason=c.get("finish_reason", ""),
+        for attempt in range(self.max_retries):
+            try:
+                response = await self._client.post(url, headers=headers, json=body)
+
+                if response.status_code != 200:
+                    error = self._map_status_to_error(response)
+                    last_error = error
+
+                    if not is_retryable_error(error):
+                        raise error
+
+                    if attempt < self.max_retries - 1:
+                        await asyncio.sleep(retry_delay)
+                        retry_delay *= 2  # Exponential backoff
+                        continue
+                    else:
+                        raise error
+
+                data = response.json()
+                return ChatCompletion(
+                    id=data.get("id", ""),
+                    model=data.get("model", self.model),
+                    choices=[
+                        ChatCompletionChoice(
+                            index=c.get("index", 0),
+                            message=c.get("message", {}),
+                            finish_reason=c.get("finish_reason", ""),
+                        )
+                        for c in data.get("choices", [])
+                    ],
+                    usage=Usage(
+                        prompt_tokens=data.get("usage", {}).get("prompt_tokens", 0),
+                        completion_tokens=data.get("usage", {}).get("completion_tokens", 0),
+                        total_tokens=data.get("usage", {}).get("total_tokens", 0),
+                    ),
+                    created=data.get("created", 0),
                 )
-                for c in data.get("choices", [])
-            ],
-            usage=Usage(
-                prompt_tokens=data.get("usage", {}).get("prompt_tokens", 0),
-                completion_tokens=data.get("usage", {}).get("completion_tokens", 0),
-                total_tokens=data.get("usage", {}).get("total_tokens", 0),
-            ),
-            created=data.get("created", 0),
-        )
+
+            except APIError:
+                raise
+            except httpx.HTTPError as e:
+                last_error = APIConnectionError(f"Connection error: {str(e)}")
+                if attempt < self.max_retries - 1:
+                    await asyncio.sleep(retry_delay)
+                    retry_delay *= 2
+                    continue
+                raise last_error
+
+        raise last_error or APIError("Max retries exceeded")
 
     def _tool_to_dict(self, tool: ToolParam) -> dict:
         """Convert a ToolParam to a dict."""
