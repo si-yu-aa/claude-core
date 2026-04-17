@@ -11,6 +11,61 @@ from claude_core.prompt.parts import (
 )
 from claude_core.prompt.templates import DEFAULT_SYSTEM_TEMPLATE
 
+
+def build_effective_prompt(
+    override: str | None,
+    coordinator: str | None,
+    agent: str | None,
+    custom: str | None,
+    default: str,
+    append: str | None = None,
+) -> str:
+    """
+    Build effective prompt using 6-level priority system.
+
+    Priority order (highest to lowest):
+    1. override - Loop mode override
+    2. coordinator - Coordinator mode
+    3. agent - Agent-specific prompt
+    4. custom - Custom user prompt
+    5. default - Default system prompt (+ append)
+    6. append - Additional content to append
+
+    Args:
+        override: Override prompt (loop mode)
+        coordinator: Coordinator mode prompt
+        agent: Agent-specific prompt
+        custom: Custom user prompt
+        default: Default system prompt
+        append: Additional content to append (used in proactive mode)
+
+    Returns:
+        The effective prompt string based on priority
+    """
+    # 1. Override (highest priority)
+    if override:
+        return override
+
+    # 2. Coordinator
+    if coordinator:
+        return coordinator
+
+    # 3. Agent
+    if agent:
+        return agent
+
+    # 4. Custom
+    if custom:
+        return custom
+
+    # 5. Default (+ append)
+    if append:
+        return f"{default}\n\n{append}"
+
+    # 6. Default only
+    return default
+
+
 class SystemPromptBuilder:
     """
     System Prompt Builder.
