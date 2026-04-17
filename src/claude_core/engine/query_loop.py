@@ -131,15 +131,24 @@ async def query(
        e. Post-processing
        f. Loop continue or stop
     """
+    from claude_core.models.message import UserMessage, AssistantMessage, create_user_message
+    from claude_core.tools.streaming_executor import StreamingToolExecutor
+
     state = QueryState(
         messages=params.messages,
         tool_use_context=params.tool_use_context,
         max_output_tokens_override=params.max_output_tokens_override,
     )
 
+    # Create LLM client if not provided in context
     client = None
-    # Build messages list for API
-    api_messages = []
+    if params.tool_use_context and hasattr(params.tool_use_context, '_client'):
+        client = params.tool_use_context._client
+    else:
+        # Create a default client - caller should set this up properly
+        from claude_core.api.client import LLMClient
+        # Default to OpenAI-compatible endpoint
+        client = None  # Will be created on first iteration if needed
 
     while True:
         # Check max turns
@@ -161,8 +170,7 @@ async def query(
             ctx_parts = [f"System context: {v}" for k, v in params.system_context.items()]
             system_content += "\n\n" + "\n".join(ctx_parts)
 
-        # Prepare messages
-        from claude_core.models.message import UserMessage
+        # Prepare messages for API
         api_messages = []
         for msg in state.messages:
             if isinstance(msg, UserMessage):
@@ -171,11 +179,16 @@ async def query(
                     api_messages.append({"role": "user", "content": content})
                 else:
                     api_messages.append({"role": "user", "content": str(content)})
+            elif isinstance(msg, AssistantMessage):
+                content = msg.message.get("content", [])
+                if isinstance(content, list):
+                    api_messages.append({"role": "assistant", "content": content})
+                else:
+                    api_messages.append({"role": "assistant", "content": str(content)})
 
         # Get tools if available
         tools = None
         if state.tool_use_context and state.tool_use_context.options.tools:
-            from claude_core.api.types import ToolParam, FunctionDefinition
             tools = []
             for tool in state.tool_use_context.options.tools:
                 tools.append({
@@ -187,12 +200,166 @@ async def query(
                     }
                 })
 
-        # Yield to let caller set up client if needed
+        # Create client if needed
         if client is None:
-            # Create a placeholder - actual client should be passed or created
-            # For now, yield a continue to signal readiness
+            # Try to get from context or use defaults
+            if state.tool_use_context and hasattr(state.tool_use_context, '_client'):
+                client = state.tool_use_context._client
+            else:
+                # Yield error and stop if no client available
+                yield {
+                    "type": "error",
+                    "error": "No LLM client configured. Set up client before calling query()."
+                }
+                yield Stop(reason="error")
+                return
+
+        # Collect content from streaming response
+        full_content = ""
+        tool_use_blocks = []
+        stop_reason = None
+
+        # Stream response from model
+        try:
+            async for event in call_model(
+                client,
+                api_messages,
+                system_content,
+                tools=tools,
+                max_tokens=params.max_output_tokens_override or DEFAULT_MAX_OUTPUT_TOKENS,
+                abort_controller=state.tool_use_context.abort_controller if state.tool_use_context else None,
+            ):
+                if event.type == "content_block_delta":
+                    content = event.delta.get("content", "")
+                    if content:
+                        full_content += content
+                        yield {
+                            "type": "content",
+                            "content": content,
+                        }
+                elif event.type == "tool_use":
+                    tool_use_blocks.append({
+                        "id": event.tool_use_id,
+                        "name": event.name,
+                        "input": event.input,
+                    })
+                elif event.type == "message_stop":
+                    stop_reason = "stop"
+
+        except Exception as e:
+            error_message = str(e)
+            is_prompt_too_long = "prompt" in error_message.lower() and "too" in error_message.lower()
+            is_max_output = "output" in error_message.lower() and "token" in error_message.lower()
+
+            if is_prompt_too_long:
+                yield {
+                    "type": "error",
+                    "error": "Prompt too long. Consider using compression or reducing context.",
+                    "error_code": "prompt_too_long",
+                }
+                yield Stop(reason="prompt_too_long")
+                return
+            elif is_max_output:
+                yield {
+                    "type": "error",
+                    "error": "Max output tokens exceeded.",
+                    "error_code": "max_output_tokens",
+                }
+                yield Stop(reason="max_output_tokens")
+                return
+            else:
+                yield {
+                    "type": "error",
+                    "error": error_message,
+                }
+                yield Stop(reason="error")
+                return
+
+        # If we got content, create an assistant message
+        if full_content:
+            assistant_msg = {
+                "type": "assistant",
+                "content": full_content,
+            }
+            yield assistant_msg
+            state.messages.append(type('obj', (object,), {
+                "type": "assistant",
+                "uuid": generate_uuid(),
+                "message": assistant_msg,
+            })())
+
+        # If there are tool use blocks, execute them
+        if tool_use_blocks:
+            # Create assistant message with tool use blocks
+            assistant_message = type('obj', (object,), {
+                "uuid": generate_uuid(),
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": tb["id"],
+                            "name": tb["name"],
+                            "input": tb["input"],
+                        }
+                        for tb in tool_use_blocks
+                    ]
+                },
+            })()
+
+            # Yield tool use events
+            for tb in tool_use_blocks:
+                yield {
+                    "type": "tool_use",
+                    "tool_use_id": tb["id"],
+                    "name": tb["name"],
+                    "input": tb["input"],
+                }
+
+            # Execute tools using StreamingToolExecutor
+            if state.tool_use_context:
+                executor = StreamingToolExecutor(
+                    tool_definitions=state.tool_use_context.options.tools,
+                    can_use_tool=params.can_use_tool,
+                    tool_use_context=state.tool_use_context,
+                )
+
+                # Add all tool blocks
+                for tb in tool_use_blocks:
+                    block = type('obj', (object,), {
+                        "id": tb["id"],
+                        "name": tb["name"],
+                        "input": tb["input"],
+                        "type": "tool_use",
+                    })()
+                    executor.add_tool(block, assistant_message)
+
+                # Get results
+                async for update in executor.get_remaining_results():
+                    if update.message:
+                        # Yield tool result message
+                        yield {
+                            "type": "tool_result",
+                            "tool_use_id": update.message.message.get("tool_use_result", {}).get("tool_use_id", "") if hasattr(update.message, 'message') else "",
+                            "content": update.message.tool_use_result if hasattr(update.message, 'tool_use_result') else str(update.message),
+                        }
+                        state.messages.append(update.message)
+
+                # Update context with any modifiers
+                state.tool_use_context = executor.get_updated_context()
+
+        # Check stop reason
+        if stop_reason == "stop" and not tool_use_blocks:
+            # Normal completion - no more tools to execute
+            yield Stop(reason="complete")
+            return
+
+        # Increment turn count and continue
+        state.turn_count += 1
+
+        # Continue the loop for more turns if tools were executed
+        if tool_use_blocks:
             yield Continue()
-
-        break  # Exit for now - actual implementation continues in full version
-
-    yield Stop(reason="complete")
+        else:
+            # No tools and no content - something went wrong
+            yield Stop(reason="complete")
+            return
