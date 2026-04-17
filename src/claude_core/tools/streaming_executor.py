@@ -9,8 +9,10 @@ import asyncio
 
 if TYPE_CHECKING:
     from claude_core.tools.base import Tool, ToolResult
-    from claude_core.models.tool import ToolUseContext, ToolUseBlock, MessageUpdate
+    from claude_core.models.tool import ToolUseContext, ToolUseBlock
     from claude_core.models.message import Message
+
+from claude_core.models.tool import MessageUpdate
 
 class ToolStatus(Enum):
     QUEUED = "queued"
@@ -164,6 +166,49 @@ class StreamingToolExecutor:
                 tool.status = ToolStatus.COMPLETED
                 return
 
+            # Validate input before execution
+            validation_result = await tool_def.validate_input(
+                tool.block.input or {},
+                self._context,
+            )
+            if not validation_result.result:
+                error_msg = validation_result.message or "Input validation failed"
+                messages.append(create_user_message(
+                    content=[{
+                        "type": "tool_result",
+                        "content": f"<tool_use_error>Validation error: {error_msg}</tool_use_error>",
+                        "is_error": True,
+                        "tool_use_id": tool.id,
+                    }],
+                    tool_use_id=tool.id,
+                    is_error=True,
+                    tool_use_result=f"Validation failed: {error_msg}",
+                ))
+                tool.results = messages
+                tool.status = ToolStatus.COMPLETED
+                return
+
+            # Check permissions before execution
+            permission_result = await tool_def.check_permissions(
+                tool.block.input or {},
+                self._context,
+            )
+            if permission_result.behavior == "deny":
+                messages.append(create_user_message(
+                    content=[{
+                        "type": "tool_result",
+                        "content": "<tool_use_error>Permission denied</tool_use_error>",
+                        "is_error": True,
+                        "tool_use_id": tool.id,
+                    }],
+                    tool_use_id=tool.id,
+                    is_error=True,
+                    tool_use_result="Permission denied",
+                ))
+                tool.results = messages
+                tool.status = ToolStatus.COMPLETED
+                return
+
             result = await tool_def.call(
                 tool.block.input or {},
                 self._context,
@@ -285,6 +330,19 @@ class StreamingToolExecutor:
 
         for result in self.get_completed_results():
             yield result
+
+    def get_updated_context(self) -> "ToolUseContext":
+        """Return the updated context after tool execution.
+
+        This should be called after get_remaining_results() to get
+        the context modified by any context_modifiers from tools.
+        """
+        # Apply all pending context modifiers from completed tools
+        for tool in self._tools:
+            if tool.status == ToolStatus.COMPLETED and tool.context_modifiers:
+                for modifier in tool.context_modifiers:
+                    self._context = modifier(self._context)
+        return self._context
 
     def _has_unfinished_tools(self) -> bool:
         return any(t.status != ToolStatus.YIELDED for t in self._tools)

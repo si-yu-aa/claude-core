@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from typing import AsyncGenerator, Any, Optional, Callable
+from dataclasses import dataclass
 import asyncio
+import json
 
 from claude_core.engine.types import (
     QueryParams,
@@ -20,10 +22,21 @@ from claude_core.api.client import LLMClient
 from claude_core.api.types import MessageParam
 from claude_core.utils.abort import AbortController
 from claude_core.utils.uuid import generate_uuid
+from claude_core.context.compression import SnipCompact, AutoCompactStrategy, reactive_compact
+from claude_core.context.budget import TokenBudget
 
 # Default max tokens for recovery attempts
 DEFAULT_MAX_OUTPUT_TOKENS = 8192
 RECOVERY_MAX_TOKENS = 65536
+
+
+@dataclass
+class BufferedToolCall:
+    """Buffered tool call being accumulated from streaming response."""
+    id: str = ""
+    name: str = ""
+    arguments: str = ""
+
 
 async def call_model(
     client: LLMClient,
@@ -41,6 +54,7 @@ async def call_model(
     2. Makes streaming chat completion request
     3. Parses SSE response into StreamEvents
     4. Handles errors and yields tool_use events
+    5. Tracks token usage from streaming response
     """
     formatted_messages = [{"role": "system", "content": system_prompt}]
     for msg in messages:
@@ -51,6 +65,14 @@ async def call_model(
                 "role": msg.type if hasattr(msg, 'type') else "user",
                 "content": str(msg.message.get("content", "")) if hasattr(msg, 'message') else str(msg)
             })
+
+    # Track usage from streaming response
+    prompt_tokens = 0
+    completion_tokens = 0
+    usage_recorded = False
+
+    # Buffer for streaming tool calls
+    buffered_tool_call: Optional[BufferedToolCall] = None
 
     try:
         async with client._client.stream(
@@ -76,14 +98,40 @@ async def call_model(
                 if line.startswith("data: "):
                     data = line[6:]
                     if data == "[DONE]":
+                        # Yield any remaining buffered tool call
+                        if buffered_tool_call and buffered_tool_call.id:
+                            try:
+                                yield ToolUseEvent(
+                                    tool_use_id=buffered_tool_call.id,
+                                    name=buffered_tool_call.name,
+                                    input=json.loads(buffered_tool_call.arguments or "{}"),
+                                )
+                            except json.JSONDecodeError:
+                                yield ToolUseEvent(
+                                    tool_use_id=buffered_tool_call.id,
+                                    name=buffered_tool_call.name,
+                                    input={},
+                                )
+                        # Yield usage at end of stream
+                        if not usage_recorded:
+                            yield {
+                                "type": "usage",
+                                "prompt_tokens": prompt_tokens,
+                                "completion_tokens": completion_tokens,
+                            }
                         yield MessageStopEvent()
                         break
 
-                    import json
                     try:
                         chunk = json.loads(data)
                     except json.JSONDecodeError:
                         continue
+
+                    # Extract usage from chunk if available
+                    if "usage" in chunk and not usage_recorded:
+                        usage_data = chunk["usage"]
+                        prompt_tokens = usage_data.get("prompt_tokens", 0)
+                        completion_tokens = usage_data.get("completion_tokens", 0)
 
                     # Parse OpenAI chat completion chunk
                     if "choices" in chunk:
@@ -97,20 +145,41 @@ async def call_model(
                                     delta={"content": delta["content"]}
                                 )
 
-                            # Tool use
+                            # Tool use - buffer the streaming arguments
                             if delta.get("tool_calls"):
                                 for tc in delta["tool_calls"]:
-                                    yield ToolUseEvent(
-                                        tool_use_id=str(tc.get("id", "")),
-                                        name=tc.get("function", {}).get("name", ""),
-                                        input=json.loads(tc.get("function", {}).get("arguments", "{}")),
-                                    )
+                                    if buffered_tool_call is None:
+                                        buffered_tool_call = BufferedToolCall()
+
+                                    # Update tool call info
+                                    if tc.get("id"):
+                                        buffered_tool_call.id = tc["id"]
+                                    if tc.get("function", {}).get("name"):
+                                        buffered_tool_call.name = tc["function"]["name"]
+                                    if tc.get("function", {}).get("arguments"):
+                                        buffered_tool_call.arguments += tc["function"]["arguments"]
 
                             # Finish reason
                             if choice.get("finish_reason"):
+                                # Yield buffered tool call if present
+                                if buffered_tool_call and buffered_tool_call.id:
+                                    try:
+                                        yield ToolUseEvent(
+                                            tool_use_id=buffered_tool_call.id,
+                                            name=buffered_tool_call.name,
+                                            input=json.loads(buffered_tool_call.arguments or "{}"),
+                                        )
+                                    except json.JSONDecodeError:
+                                        # Invalid JSON, return empty input
+                                        yield ToolUseEvent(
+                                            tool_use_id=buffered_tool_call.id,
+                                            name=buffered_tool_call.name,
+                                            input={},
+                                        )
+                                    buffered_tool_call = None
+
                                 yield MessageStopEvent()
     except Exception as e:
-        # Re-raise as API error
         from claude_core.api.errors import APIError
         raise APIError(message=str(e))
 
@@ -140,15 +209,35 @@ async def query(
         max_output_tokens_override=params.max_output_tokens_override,
     )
 
-    # Create LLM client if not provided in context
+    # Initialize compression strategies
+    snip_compact = SnipCompact(threshold=50000)
+    auto_compact = AutoCompactStrategy(threshold=80000)
+
+    # Initialize token budget if context has max_budget
+    budget = None
+    if params.tool_use_context and params.tool_use_context.options.max_budget_usd:
+        budget = TokenBudget(max_tokens=int(params.tool_use_context.options.max_budget_usd * 1000))
+
+    # Get client from context
     client = None
     if params.tool_use_context and hasattr(params.tool_use_context, '_client'):
         client = params.tool_use_context._client
-    else:
-        # Create a default client - caller should set this up properly
-        from claude_core.api.client import LLMClient
-        # Default to OpenAI-compatible endpoint
-        client = None  # Will be created on first iteration if needed
+
+    if client is None:
+        yield {
+            "type": "error",
+            "error": "No LLM client configured. Set up client before calling query()."
+        }
+        yield Stop(reason="error")
+        return
+
+    # Recovery state for max-output tokens
+    max_output_recovery_count = 0
+    current_max_tokens = params.max_output_tokens_override or DEFAULT_MAX_OUTPUT_TOKENS
+
+    # Model fallback state
+    primary_model = params.fallback_model
+    current_model = None
 
     while True:
         # Check max turns
@@ -160,6 +249,25 @@ async def query(
         if state.tool_use_context and state.tool_use_context.abort_controller.signal.aborted:
             yield Stop(reason="aborted")
             return
+
+        # Check budget
+        if budget and budget.is_exhausted():
+            yield Stop(reason="budget_exhausted")
+            return
+
+        # Context compression: snip if needed
+        if snip_compact.should_compact(state.messages):
+            result = snip_compact.compact(state.messages)
+            state.messages = result.messages
+            yield {
+                "type": "compaction",
+                "tokens_freed": result.tokens_freed,
+                "reason": "snip",
+            }
+
+        # Determine which model to use
+        if current_model is None:
+            current_model = client.model if client else primary_model
 
         # Build system prompt with context
         system_content = params.system_prompt
@@ -200,20 +308,6 @@ async def query(
                     }
                 })
 
-        # Create client if needed
-        if client is None:
-            # Try to get from context or use defaults
-            if state.tool_use_context and hasattr(state.tool_use_context, '_client'):
-                client = state.tool_use_context._client
-            else:
-                # Yield error and stop if no client available
-                yield {
-                    "type": "error",
-                    "error": "No LLM client configured. Set up client before calling query()."
-                }
-                yield Stop(reason="error")
-                return
-
         # Collect content from streaming response
         full_content = ""
         tool_use_blocks = []
@@ -226,10 +320,13 @@ async def query(
                 api_messages,
                 system_content,
                 tools=tools,
-                max_tokens=params.max_output_tokens_override or DEFAULT_MAX_OUTPUT_TOKENS,
+                max_tokens=current_max_tokens,
                 abort_controller=state.tool_use_context.abort_controller if state.tool_use_context else None,
             ):
-                if event.type == "content_block_delta":
+                # Handle both dict events (like usage) and StreamEvent objects
+                event_type = event.type if hasattr(event, 'type') else event.get("type")
+
+                if event_type == "content_block_delta":
                     content = event.delta.get("content", "")
                     if content:
                         full_content += content
@@ -237,14 +334,17 @@ async def query(
                             "type": "content",
                             "content": content,
                         }
-                elif event.type == "tool_use":
+                elif event_type == "tool_use":
                     tool_use_blocks.append({
                         "id": event.tool_use_id,
                         "name": event.name,
                         "input": event.input,
                     })
-                elif event.type == "message_stop":
+                elif event_type == "message_stop":
                     stop_reason = "stop"
+                elif event_type == "usage":
+                    # Usage events from streaming
+                    pass
 
         except Exception as e:
             error_message = str(e)
@@ -252,6 +352,15 @@ async def query(
             is_max_output = "output" in error_message.lower() and "token" in error_message.lower()
 
             if is_prompt_too_long:
+                if reactive_compact(state.messages, error_message):
+                    result = auto_compact.compact(state.messages, system_content)
+                    state.messages = result.messages
+                    yield {
+                        "type": "compaction",
+                        "tokens_freed": result.tokens_freed,
+                        "reason": "reactive",
+                    }
+                    continue
                 yield {
                     "type": "error",
                     "error": "Prompt too long. Consider using compression or reducing context.",
@@ -260,6 +369,15 @@ async def query(
                 yield Stop(reason="prompt_too_long")
                 return
             elif is_max_output:
+                if current_max_tokens < RECOVERY_MAX_TOKENS and max_output_recovery_count < 3:
+                    max_output_recovery_count += 1
+                    current_max_tokens = min(current_max_tokens * 2, RECOVERY_MAX_TOKENS)
+                    yield {
+                        "type": "error",
+                        "error": f"Max output tokens exceeded, retrying with {current_max_tokens} tokens (attempt {max_output_recovery_count})",
+                        "error_code": "max_output_tokens",
+                    }
+                    continue
                 yield {
                     "type": "error",
                     "error": "Max output tokens exceeded.",
@@ -268,6 +386,16 @@ async def query(
                 yield Stop(reason="max_output_tokens")
                 return
             else:
+                if params.fallback_model and current_model != params.fallback_model:
+                    yield {
+                        "type": "error",
+                        "error": f"Primary model failed ({current_model}), trying fallback: {params.fallback_model}",
+                        "error_code": "model_fallback",
+                    }
+                    current_model = params.fallback_model
+                    current_max_tokens = params.max_output_tokens_override or DEFAULT_MAX_OUTPUT_TOKENS
+                    max_output_recovery_count = 0
+                    continue
                 yield {
                     "type": "error",
                     "error": error_message,
@@ -290,7 +418,6 @@ async def query(
 
         # If there are tool use blocks, execute them
         if tool_use_blocks:
-            # Create assistant message with tool use blocks
             assistant_message = type('obj', (object,), {
                 "uuid": generate_uuid(),
                 "message": {
@@ -336,7 +463,6 @@ async def query(
                 # Get results
                 async for update in executor.get_remaining_results():
                     if update.message:
-                        # Yield tool result message
                         yield {
                             "type": "tool_result",
                             "tool_use_id": update.message.message.get("tool_use_result", {}).get("tool_use_id", "") if hasattr(update.message, 'message') else "",
@@ -349,17 +475,14 @@ async def query(
 
         # Check stop reason
         if stop_reason == "stop" and not tool_use_blocks:
-            # Normal completion - no more tools to execute
             yield Stop(reason="complete")
             return
 
         # Increment turn count and continue
         state.turn_count += 1
 
-        # Continue the loop for more turns if tools were executed
         if tool_use_blocks:
             yield Continue()
         else:
-            # No tools and no content - something went wrong
             yield Stop(reason="complete")
             return
