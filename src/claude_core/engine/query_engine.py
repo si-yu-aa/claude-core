@@ -3,16 +3,16 @@
 from __future__ import annotations
 
 from typing import AsyncGenerator, Any, Optional
-import asyncio
 
 from claude_core.engine.config import QueryEngineConfig
-from claude_core.engine.query_loop import query, call_model
-from claude_core.engine.types import QueryParams, StreamEvent
-from claude_core.models.message import UserMessage, create_user_message
+from claude_core.engine.query_loop import query
+from claude_core.engine.types import QueryParams
+from claude_core.models.message import create_user_message
 from claude_core.utils.abort import AbortController, create_child_abort_controller
 from claude_core.api.client import LLMClient
 
 EMPTY_USAGE = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
 
 class QueryEngine:
     """
@@ -57,14 +57,12 @@ class QueryEngine:
     async def submit_message(
         self,
         content: str,
-        attachments: list | None = None,
-    ) -> AsyncGenerator[StreamEvent | dict, None]:
+    ) -> AsyncGenerator[dict, None]:
         """
         Submit a user message and return an event stream.
 
         Args:
             content: The user's message content
-            attachments: Optional list of attachments
 
         Yields:
             Stream events as they arrive
@@ -73,13 +71,13 @@ class QueryEngine:
         user_msg = create_user_message(content=content)
         self._messages.append(user_msg)
 
-        # Build query params
-        client = await self._get_client()
+        # Ensure client is initialized
+        await self._get_client()
 
-        # Get tools from config if available
-        tools = []
+        # Prepare tools if available
+        tools = None
         if hasattr(self, '_tools') and self._tools:
-            from claude_core.api.types import ToolParam, FunctionDefinition
+            tools = []
             for tool in self._tools:
                 tools.append({
                     "type": "function",
@@ -90,6 +88,23 @@ class QueryEngine:
                     }
                 })
 
+        # Build tool_use_context with tools if tools are available
+        tool_use_context = None
+        if hasattr(self, '_tool_use_context') and self._tool_use_context:
+            tool_use_context = self._tool_use_context
+            if tools:
+                tool_use_context.options.tools = tools
+            tool_use_context.abort_controller = create_child_abort_controller(
+                self._abort_controller
+            )
+        elif tools:
+            # Create minimal context if no context but tools provided
+            from claude_core.models.tool import ToolUseContext, ToolUseContextOptions
+            tool_use_context = ToolUseContext(
+                options=ToolUseContextOptions(tools=tools),
+                abort_controller=create_child_abort_controller(self._abort_controller),
+            )
+
         # Create query params
         params = QueryParams(
             messages=self._messages,
@@ -97,19 +112,12 @@ class QueryEngine:
             user_context={},
             system_context={},
             can_use_tool=self._can_use_tool if hasattr(self, '_can_use_tool') else lambda *args: True,
-            tool_use_context=self._tool_use_context if hasattr(self, '_tool_use_context') else None,
+            tool_use_context=tool_use_context,
             max_turns=self._config.max_turns,
             max_output_tokens_override=self._config.max_output_tokens,
             fallback_model=None,
             query_source="sdk",
         )
-
-        # Run query loop
-        tool_use_context = params.tool_use_context
-        if tool_use_context:
-            tool_use_context.abort_controller = create_child_abort_controller(
-                self._abort_controller
-            )
 
         try:
             async for event in query(params):
@@ -119,9 +127,6 @@ class QueryEngine:
                     yield event
                 else:
                     yield event
-
-            # Update usage stats if available
-            # (actual usage tracking would come from call_model)
 
         except Exception as e:
             yield {"type": "error", "error": str(e)}
@@ -139,11 +144,12 @@ class QueryEngine:
         """
         results = []
         async for event in self.submit_message(prompt, **kwargs):
-            if hasattr(event, 'type') and event.type == "content_block_delta":
-                results.append(event.delta.get("content", ""))
-            elif isinstance(event, dict):
+            if isinstance(event, dict):
                 if event.get("type") == "content":
                     results.append(event.get("content", ""))
+            elif hasattr(event, 'type'):
+                if event.type == "content_block_delta":
+                    results.append(event.delta.get("content", ""))
 
         return "".join(results)
 
