@@ -102,6 +102,26 @@ async def main():
 asyncio.run(main())
 ```
 
+### 运行示例
+
+确保设置环境变量后即可运行：
+
+```bash
+# 设置 API key
+export OPENAI_API_KEY=your-api-key
+
+# 运行交互式对话示例
+python examples/simple_chat.py
+
+# 运行带工具调用的示例
+python examples/with_tools.py
+
+# 或直接运行 SDK（单次对话）
+python -m claude_core
+```
+
+更多示例见 [examples/](./examples/) 目录。
+
 ## 项目结构
 
 ```
@@ -209,6 +229,25 @@ executor = StreamingToolExecutor(
 
 ```bash
 pytest tests/ -v
+```
+
+## 示例
+
+项目包含多个可直接运行的示例：
+
+| 示例 | 说明 |
+|------|------|
+| `examples/simple_chat.py` | 基本对话，展示流式响应 |
+| `examples/with_tools.py` | 演示工具注册和调用 |
+
+运行前设置环境变量：
+
+```bash
+export OPENAI_API_KEY=your-api-key
+export OPENAI_BASE_URL=https://api.openai.com/v1  # 可选
+export OPENAI_MODEL=gpt-4o  # 可选
+
+python examples/simple_chat.py
 ```
 
 ## 文档
