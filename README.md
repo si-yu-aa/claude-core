@@ -151,6 +151,11 @@ claude-core/
 │   └── langfuse/             # 分布式追踪
 │       └── client.py         # LangfuseTracer
 └── tests/                    # 测试
+    ├── smoke/                 # Smoke tests (no API key required)
+    │   ├── test_query_loop_smoke.py
+    │   ├── test_tool_executor_smoke.py
+    │   ├── test_agent_smoke.py
+    │   └── test_prompt_manager_smoke.py
 ```
 
 ## 核心概念
@@ -213,10 +218,22 @@ executor = StreamingToolExecutor(
 | `max_output_tokens` | int | None | 最大输出 tokens |
 | `timeout` | float | 120.0 | HTTP 超时（秒） |
 
+## 前置条件
+
+- Python >= 3.11
+- 安装 dev 依赖：`pip install -e ".[dev]"`
+
 ## 运行测试
 
 ```bash
-pytest tests/ -v
+# 运行所有测试
+python -m pytest
+
+# 运行 smoke tests（不需要 API key）
+python -m pytest tests/smoke/
+
+# 运行所有测试（详细输出）
+python -m pytest tests/ -v
 ```
 
 ## 示例
