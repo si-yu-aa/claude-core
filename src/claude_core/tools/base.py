@@ -161,3 +161,27 @@ def build_tool(tool_def: dict) -> Tool:
             setattr(tool, key, value)
 
     return tool
+
+
+def tool_matches_name(tool: Tool, name: str) -> bool:
+    """Check if a tool matches a given name.
+
+    Args:
+        tool: The tool to check
+        name: The name to match against
+
+    Returns:
+        True if the tool's name or any of its aliases match the given name
+    """
+    if tool.name == name:
+        return True
+
+    # Check aliases - could be a list or callable
+    if hasattr(tool, 'aliases'):
+        aliases = tool.aliases
+        if callable(aliases):
+            aliases = aliases()
+        if name in aliases:
+            return True
+
+    return False

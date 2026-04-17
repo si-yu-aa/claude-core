@@ -56,7 +56,7 @@ class TestContextManager:
     def test_context_manager_initialization(self):
         """Should initialize ContextManager."""
         manager = ContextManager(max_tokens=100000, model="gpt-4o")
-        assert manager.model == "gpt-4o"
+        assert manager._model == "gpt-4o"
 
     def test_model_context_window(self):
         """Should return correct context windows."""

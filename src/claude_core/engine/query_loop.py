@@ -18,7 +18,7 @@ from claude_core.engine.types import (
     Continue,
     Stop,
 )
-from claude_core.api.client import LLMClient
+from claude_core.api.providers import LLMProvider
 from claude_core.api.types import MessageParam
 from claude_core.utils.abort import AbortController
 from claude_core.utils.uuid import generate_uuid

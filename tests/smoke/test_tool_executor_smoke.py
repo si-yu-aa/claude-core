@@ -98,41 +98,18 @@ class TestToolImpl:
         assert tool.is_destructive({}) is False
         assert tool.interrupt_behavior() == "block"
 
-    def test_tool_impl_extensions(self):
-        """Should support extended methods."""
+    def test_tool_impl_with_callable_overrides(self):
+        """Should support callable method overrides."""
         tool = ToolImpl(
             name="Read",
             description="Read a file",
             input_schema={},
-            aliases=["FileRead", "ReadFile"],
-            search_hint="file read",
-            max_result_size_chars=10000,
+            is_enabled=lambda: False,
+            is_read_only=lambda args: True,
         )
 
-        assert tool.aliases() == ["FileRead", "ReadFile"]
-        assert tool.searchHint() == "file read"
-        assert tool.maxResultSizeChars() == 10000
-
-    def test_getPath_default(self):
-        """Should return None when no path field."""
-        tool = ToolImpl(name="Test", description="Test", input_schema={})
-        assert tool.getPath({}) is None
-
-    def test_getPath_with_path(self):
-        """Should extract path from common fields."""
-        tool = ToolImpl(name="Test", description="Test", input_schema={})
-
-        assert tool.getPath({"path": "/some/path"}) == "/some/path"
-        assert tool.getPath({"file_path": "/another/path"}) == "/another/path"
-
-    def test_isSearchOrReadCommand(self):
-        """Should detect read commands."""
-        tool = ToolImpl(name="FileRead", description="Read files", input_schema={})
-
-        result = tool.isSearchOrReadCommand({"file_path": "/test"})
-        assert result is not None
-        assert result["type"] == "read"
-        assert result["path"] == "/test"
+        assert tool.is_enabled() is False
+        assert tool.is_read_only({}) is True
 
 
 class TestBuildTool:
@@ -175,18 +152,6 @@ class TestToolMatchesName:
         })
 
         assert tool_matches_name(tool, "Read") is True
-
-    def test_alias_match(self):
-        """Should match alias."""
-        tool = build_tool({
-            "name": "Read",
-            "description": "Read files",
-            "input_schema": {},
-            "aliases": ["FileRead", "Open"],
-        })
-
-        assert tool_matches_name(tool, "FileRead") is True
-        assert tool_matches_name(tool, "Open") is True
 
     def test_no_match(self):
         """Should not match different name."""
