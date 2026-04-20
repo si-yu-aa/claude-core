@@ -8,6 +8,7 @@ import re
 import fnmatch
 
 from claude_core.tools.base import Tool, ToolResult, build_tool
+from claude_core.tools.permissions import build_permission_checker
 
 if TYPE_CHECKING:
     from claude_core.models.tool import ToolUseContext
@@ -122,4 +123,8 @@ def create_grep_tool() -> Tool:
         },
         "call": call,
         "is_concurrency_safe": is_concurrency_safe,
+        "check_permissions": build_permission_checker(
+            lambda args: "file:grep",
+            "file_grep",
+        ),
     })

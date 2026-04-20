@@ -27,7 +27,7 @@ def test_query_state_defaults():
         messages=[],
         tool_use_context=None,
     )
-    assert state.turn_count == 1
+    assert state.turn_count == 0
     assert state.max_output_tokens_recovery_count == 0
     assert state.has_attempted_reactive_compact is False
 

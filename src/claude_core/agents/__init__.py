@@ -3,6 +3,7 @@
 from claude_core.agents.base import BaseAgent
 from claude_core.agents.worker import WorkerAgent
 from claude_core.agents.mailbox import Mailbox, MailboxMessage
+from claude_core.agents.runtime import AgentRuntime
 from claude_core.agents.types import AgentConfig, AgentStatus, AgentResult, ForkContext
 
 __all__ = [
@@ -10,6 +11,7 @@ __all__ = [
     "WorkerAgent",
     "Mailbox",
     "MailboxMessage",
+    "AgentRuntime",
     "AgentConfig",
     "AgentStatus",
     "AgentResult",

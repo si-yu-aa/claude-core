@@ -21,6 +21,7 @@ from claude_core.api.errors import (
     APIConnectionError,
     is_retryable_error,
 )
+from claude_core.api.providers import ProviderAdapter, get_provider_adapter
 
 DEFAULT_TIMEOUT = 120.0
 MAX_RETRIES = 3
@@ -36,13 +37,17 @@ class LLMClient:
 
     def __init__(
         self,
-        base_url: str,
+        base_url: str | None,
         api_key: str,
         model: str = "gpt-4o",
+        provider: str = "openai",
         timeout: float = DEFAULT_TIMEOUT,
         max_retries: int = MAX_RETRIES,
     ):
-        self.base_url = base_url.rstrip("/")
+        self.provider_name = provider
+        self.provider: ProviderAdapter = get_provider_adapter(provider)
+        resolved_base_url = base_url or self.provider.default_base_url
+        self.base_url = resolved_base_url.rstrip("/")
         self.api_key = api_key
         self.model = model
         self.timeout = timeout
@@ -55,10 +60,30 @@ class LLMClient:
 
     def _build_headers(self) -> dict[str, str]:
         """Build request headers."""
-        return {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
+        return self.provider.build_headers(self.api_key)
+
+    def _build_chat_completions_url(self) -> str:
+        """Build the chat completions URL for the active provider."""
+        return self.provider.build_chat_completions_url(self.base_url)
+
+    def _build_request_body(
+        self,
+        *,
+        model: str,
+        messages: list[dict[str, Any]],
+        tools: list[ToolParam] | None = None,
+        stream: bool = False,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Build provider-specific request body."""
+        tool_payload = [self._tool_to_dict(t) for t in tools] if tools else None
+        return self.provider.build_request_body(
+            model=model,
+            messages=messages,
+            tools=tool_payload,
+            stream=stream,
+            **kwargs,
+        )
 
     def _map_status_to_error(self, response: httpx.Response) -> APIError:
         """Map HTTP status code to appropriate error type."""
@@ -90,17 +115,14 @@ class LLMClient:
         **kwargs: Any,
     ) -> ChatCompletion:
         """Make a non-streaming chat completion request with retry logic."""
-        url = f"{self.base_url}/chat/completions"
+        url = self._build_chat_completions_url()
         headers = self._build_headers()
-
-        body: dict[str, Any] = {
-            "model": self.model,
-            "messages": messages,
+        body = self._build_request_body(
+            model=self.model,
+            messages=messages,
+            tools=tools,
             **kwargs,
-        }
-
-        if tools:
-            body["tools"] = [self._tool_to_dict(t) for t in tools]
+        )
 
         last_error: APIError | None = None
         retry_delay = INITIAL_RETRY_DELAY

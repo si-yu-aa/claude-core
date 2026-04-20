@@ -136,7 +136,13 @@ claude-core/
 │   │       ├── file_write.py # 文件写入
 │   │       ├── file_edit.py  # 文件编辑
 │   │       ├── glob.py       # 文件搜索
-│   │       └── grep.py       # 内容搜索
+│   │       ├── grep.py       # 内容搜索
+│   │       ├── mcp.py        # MCP 资源列举/读取
+│   │       ├── task.py       # 任务管理工具
+│   │       └── agent.py      # 子 Agent 调度工具
+│   ├── mcp/                  # MCP 最小抽象
+│   │   ├── client.py         # MCPClient
+│   │   └── types.py          # MCPResource / Content
 │   ├── context/              # 上下文管理
 │   │   ├── manager.py        # ContextManager
 │   │   ├── compression.py    # 压缩策略
@@ -146,8 +152,8 @@ claude-core/
 │   │   └── templates.py      # 默认模板
 │   ├── agents/               # Agent 系统
 │   │   └── worker.py         # WorkerAgent
-│   ├── mcp/                  # MCP 客户端
-│   │   └── client.py         # MCP JSON-RPC 客户端
+│   ├── tasks/                # 后台任务状态追踪
+│   │   └── types.py          # TaskState / Tracker
 │   └── langfuse/             # 分布式追踪
 │       └── client.py         # LangfuseTracer
 └── tests/                    # 测试
@@ -212,8 +218,10 @@ executor = StreamingToolExecutor(
 | 参数 | 类型 | 默认值 | 描述 |
 |------|------|--------|------|
 | `api_key` | str | - | API 密钥（必填） |
-| `base_url` | str | `https://api.openai.com/v1` | API 基础 URL |
+| `provider` | str | `openai` | Provider 名称（当前支持 `openai` / `gemini`） |
+| `base_url` | str | provider 默认值 | API 基础 URL |
 | `model` | str | `gpt-4o` | 模型名称 |
+| `fallback_model` | str | None | 主模型失败时的回退模型 |
 | `max_turns` | int | None | 最大对话轮次 |
 | `max_output_tokens` | int | None | 最大输出 tokens |
 | `timeout` | float | 120.0 | HTTP 超时（秒） |

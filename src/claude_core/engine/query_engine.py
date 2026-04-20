@@ -50,6 +50,7 @@ class QueryEngine:
                 base_url=self._config.base_url,
                 api_key=self._config.api_key,
                 model=self._config.model,
+                provider=self._config.provider,
                 timeout=self._config.timeout,
             )
         return self._client
@@ -107,7 +108,7 @@ class QueryEngine:
             tool_use_context=tool_use_context,
             max_turns=self._config.max_turns,
             max_output_tokens_override=self._config.max_output_tokens,
-            fallback_model=None,
+            fallback_model=self._config.fallback_model,
             query_source="sdk",
         )
 

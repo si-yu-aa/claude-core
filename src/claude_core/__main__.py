@@ -14,22 +14,32 @@ from claude_core import QueryEngine, QueryEngineConfig
 
 
 async def main():
-    api_key = os.getenv("OPENAI_API_KEY")
+    provider = os.getenv("CLAUDE_CORE_PROVIDER", "openai")
+    api_key_env = "GEMINI_API_KEY" if provider == "gemini" else "OPENAI_API_KEY"
+    default_base_url = (
+        "https://generativelanguage.googleapis.com/v1beta/openai"
+        if provider == "gemini"
+        else "https://api.openai.com/v1"
+    )
+
+    api_key = os.getenv(api_key_env)
     if not api_key:
-        print("错误: 请设置 OPENAI_API_KEY 环境变量")
-        print("  export OPENAI_API_KEY=your-api-key")
+        print(f"错误: 请设置 {api_key_env} 环境变量")
+        print(f"  export {api_key_env}=your-api-key")
         return
 
-    base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    base_url = os.getenv("OPENAI_BASE_URL", default_base_url)
     model = os.getenv("OPENAI_MODEL", "gpt-4o")
 
     print(f"Claude Core SDK")
+    print(f"Provider: {provider}")
     print(f"模型: {model}")
     print(f"API: {base_url}")
     print("-" * 50)
 
     config = QueryEngineConfig(
         api_key=api_key,
+        provider=provider,
         base_url=base_url,
         model=model,
     )

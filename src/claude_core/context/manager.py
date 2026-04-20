@@ -52,6 +52,11 @@ class ContextManager:
         self._reactive_compact = ReactiveCompact()
 
     @property
+    def model(self) -> str:
+        """Return the active model identifier."""
+        return self._model
+
+    @property
     def budget(self) -> TokenBudget:
         """Get the token budget."""
         return self._budget
@@ -206,48 +211,18 @@ class ContextManager:
         self._budget.reset()
 
 
-# Model context window sizes (in tokens)
-_MODEL_CONTEXT_WINDOWS = {
-    "gpt-4o": 128000,
-    "gpt-4-turbo": 128000,
-    "gpt-4": 8192,
-    "gpt-4-32k": 32768,
-    "gpt-3.5-turbo": 16385,
-    "gpt-3.5-turbo-16k": 16385,
-    "claude-3-opus": 200000,
-    "claude-3-sonnet": 200000,
-    "claude-3-haiku": 200000,
-    "claude-3.5-opus": 200000,
-    "claude-3.5-sonnet": 200000,
-    "claude-3.5-haiku": 200000,
-}
-
-# Models with 1M context window
-_MODELS_WITH_1M_CONTEXT = {
-    "claude-3.5-sonnet-20240620": True,
-    "claude-3.5-sonnet-20241022": True,
-}
-
-
 def get_model_context_window(model: str) -> int:
-    """Get the context window size for a model.
-
-    Args:
-        model: The model name
-
-    Returns:
-        The context window size in tokens, defaults to 128000
-    """
-    return _MODEL_CONTEXT_WINDOWS.get(model, 128000)
+    """Return a conservative context window estimate for known models."""
+    normalized = model.lower()
+    if "1m" in normalized:
+        return 1_000_000
+    if normalized == "gpt-4":
+        return 8192
+    if normalized in {"gpt-4o", "gpt-4.1", "gpt-4.1-mini"}:
+        return 128_000
+    return 128_000
 
 
 def has_1m_context(model: str) -> bool:
-    """Check if a model has a 1M token context window.
-
-    Args:
-        model: The model name
-
-    Returns:
-        True if the model has a 1M context window
-    """
-    return model in _MODELS_WITH_1M_CONTEXT
+    """Return whether the model supports ~1M context."""
+    return get_model_context_window(model) >= 1_000_000

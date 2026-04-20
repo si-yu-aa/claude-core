@@ -22,8 +22,9 @@ class ValidationResult:
 @dataclass
 class PermissionResult:
     """Result of permission check."""
-    behavior: str  # "allow", "deny", "ask"
+    behavior: str  # "allow", "deny", "ask", "passthrough"
     updated_input: dict[str, Any] | None = None
+    message: str | None = None
     decision_classification: str | None = None
 
 @dataclass
@@ -88,10 +89,13 @@ class ToolImpl:
     """
     Tool implementation class with attribute access.
     """
-    def __init__(self, name: str, description: str, input_schema: Any):
+    def __init__(self, name: str, description: str, input_schema: Any, **kwargs: Any):
         self.name = name
         self.description = description
         self.input_schema = input_schema
+        self._aliases = kwargs.get("aliases", [])
+        self._search_hint = kwargs.get("search_hint")
+        self._max_result_size_chars = kwargs.get("max_result_size_chars")
 
     async def validate_input(
         self,
@@ -124,6 +128,29 @@ class ToolImpl:
     def interrupt_behavior(self) -> str:
         return "block"
 
+    def aliases(self) -> list[str]:
+        return list(self._aliases)
+
+    def searchHint(self) -> str | None:
+        return self._search_hint
+
+    def maxResultSizeChars(self) -> int | None:
+        return self._max_result_size_chars
+
+    def getPath(self, args: dict[str, Any]) -> str | None:
+        return args.get("path") or args.get("file_path")
+
+    def isSearchOrReadCommand(self, args: dict[str, Any]) -> dict[str, str] | None:
+        path = self.getPath(args)
+        if path is None:
+            return None
+        lowered = self.name.lower()
+        if "read" in lowered:
+            return {"type": "read", "path": path}
+        if "grep" in lowered or "glob" in lowered or "search" in lowered:
+            return {"type": "search", "path": path}
+        return None
+
 def build_tool(tool_def: dict) -> Tool:
     """
     Build a complete Tool from a partial definition.
@@ -132,6 +159,9 @@ def build_tool(tool_def: dict) -> Tool:
         name=tool_def["name"],
         description=tool_def.get("description", ""),
         input_schema=tool_def["input_schema"],
+        aliases=tool_def.get("aliases", []),
+        search_hint=tool_def.get("search_hint"),
+        max_result_size_chars=tool_def.get("max_result_size_chars"),
     )
 
     # Override defaults with user-provided callables if present
@@ -164,24 +194,11 @@ def build_tool(tool_def: dict) -> Tool:
 
 
 def tool_matches_name(tool: Tool, name: str) -> bool:
-    """Check if a tool matches a given name.
-
-    Args:
-        tool: The tool to check
-        name: The name to match against
-
-    Returns:
-        True if the tool's name or any of its aliases match the given name
-    """
+    """Return True when the tool name or alias matches."""
     if tool.name == name:
         return True
-
-    # Check aliases - could be a list or callable
-    if hasattr(tool, 'aliases'):
-        aliases = tool.aliases
-        if callable(aliases):
-            aliases = aliases()
-        if name in aliases:
-            return True
-
-    return False
+    aliases = []
+    if hasattr(tool, "aliases"):
+        aliases_attr = tool.aliases
+        aliases = aliases_attr() if callable(aliases_attr) else aliases_attr
+    return name in aliases

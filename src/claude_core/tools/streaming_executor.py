@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from typing import AsyncGenerator, Callable, Awaitable, Any, TYPE_CHECKING
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 import asyncio
 
@@ -13,6 +13,8 @@ if TYPE_CHECKING:
     from claude_core.models.message import Message
 
 from claude_core.models.tool import MessageUpdate
+from claude_core.tools.base import tool_matches_name
+from claude_core.utils.abort import create_child_abort_controller
 
 class ToolStatus(Enum):
     QUEUED = "queued"
@@ -27,14 +29,15 @@ class TrackedTool:
     assistant_message: Any
     status: ToolStatus = ToolStatus.QUEUED
     is_concurrency_safe: bool = False
-    promise: Awaitable | None = field(default=None)
+    promise: asyncio.Task[Any] | None = field(default=None)
     results: list["Message"] = field(default_factory=list)
     pending_progress: list["Message"] = field(default_factory=list)
     context_modifiers: list[Callable] = field(default_factory=list)
+    context_modifiers_applied: bool = False
 
 def find_tool_by_name(tools: list["Tool"], name: str) -> "Tool | None":
     for tool in tools:
-        if tool.name == name:
+        if tool_matches_name(tool, name):
             return tool
     return None
 
@@ -83,6 +86,7 @@ class StreamingToolExecutor:
 
     def discard(self) -> None:
         self._discarded = True
+        self._sibling_abort_controller.abort("streaming_fallback")
 
     def add_tool(self, block: "ToolUseBlock", assistant_message: Any) -> None:
         tool_def = find_tool_by_name(self._tool_definitions, block.name)
@@ -139,13 +143,14 @@ class StreamingToolExecutor:
                 continue
 
             if self._can_execute_tool(tool.is_concurrency_safe):
-                await self._execute_tool(tool)
+                tool.status = ToolStatus.EXECUTING
+                tool.promise = asyncio.create_task(self._execute_tool(tool))
+                if not tool.is_concurrency_safe:
+                    break
             elif not tool.is_concurrency_safe:
                 break
 
     async def _execute_tool(self, tool: TrackedTool) -> None:
-        tool.status = ToolStatus.EXECUTING
-
         messages: list[Message] = []
         context_modifiers: list[Callable] = []
 
@@ -157,6 +162,7 @@ class StreamingToolExecutor:
             return
 
         tool_abort_controller = create_child_abort_controller(self._sibling_abort_controller)
+        tool_context = replace(self._context, abort_controller=tool_abort_controller)
 
         try:
             tool_def = find_tool_by_name(self._tool_definitions, tool.block.name)
@@ -169,7 +175,7 @@ class StreamingToolExecutor:
             # Validate input before execution
             validation_result = await tool_def.validate_input(
                 tool.block.input or {},
-                self._context,
+                tool_context,
             )
             if not validation_result.result:
                 error_msg = validation_result.message or "Input validation failed"
@@ -191,27 +197,33 @@ class StreamingToolExecutor:
             # Check permissions before execution
             permission_result = await tool_def.check_permissions(
                 tool.block.input or {},
-                self._context,
+                tool_context,
             )
-            if permission_result.behavior == "deny":
+            if permission_result.behavior in {"deny", "ask"}:
+                error_msg = permission_result.message or (
+                    "Permission denied"
+                    if permission_result.behavior == "deny"
+                    else "Permission requires user confirmation"
+                )
                 messages.append(create_user_message(
                     content=[{
                         "type": "tool_result",
-                        "content": "<tool_use_error>Permission denied</tool_use_error>",
+                        "content": f"<tool_use_error>{error_msg}</tool_use_error>",
                         "is_error": True,
                         "tool_use_id": tool.id,
                     }],
                     tool_use_id=tool.id,
                     is_error=True,
-                    tool_use_result="Permission denied",
+                    tool_use_result=error_msg,
                 ))
                 tool.results = messages
                 tool.status = ToolStatus.COMPLETED
                 return
 
+            call_args = permission_result.updated_input or tool.block.input or {}
             result = await tool_def.call(
-                tool.block.input or {},
-                self._context,
+                call_args,
+                tool_context,
                 self._can_use_tool,
                 None,
             )
@@ -236,6 +248,7 @@ class StreamingToolExecutor:
         except Exception as e:
             self._has_errored = True
             self._errored_tool_description = f"{tool.block.name}"
+            self._sibling_abort_controller.abort("sibling_error")
             messages.append(create_user_message(
                 content=[{
                     "type": "tool_result",
@@ -247,6 +260,8 @@ class StreamingToolExecutor:
                 is_error=True,
                 tool_use_result=str(e),
             ))
+        finally:
+            tool_abort_controller.dispose()
 
         tool.results = messages
         tool.context_modifiers = context_modifiers
@@ -255,6 +270,7 @@ class StreamingToolExecutor:
         if not tool.is_concurrency_safe:
             for modifier in context_modifiers:
                 self._context = modifier(self._context)
+            tool.context_modifiers_applied = True
 
         asyncio.create_task(self._process_queue())
 
@@ -263,7 +279,12 @@ class StreamingToolExecutor:
             return "streaming_fallback"
         if self._has_errored:
             return "sibling_error"
-        if self._context.abort_controller.signal.aborted:
+        if self._sibling_abort_controller.signal.aborted:
+            reason = self._sibling_abort_controller.signal.reason
+            if reason == "streaming_fallback":
+                return "streaming_fallback"
+            if reason == "sibling_error":
+                return "sibling_error"
             return "user_interrupted"
         return None
 
@@ -326,7 +347,16 @@ class StreamingToolExecutor:
                     self._progress_available_resolve = progress_promise.set_result
 
                     if executing_promises:
-                        await asyncio.race([*executing_promises, progress_promise])
+                        done, pending = await asyncio.wait(
+                            [*executing_promises, progress_promise],
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        if progress_promise in pending:
+                            progress_promise.cancel()
+                    else:
+                        # Yield control when there are executing tools but no
+                        # tracked promise object (defensive fallback).
+                        await asyncio.sleep(0.01)
 
         for result in self.get_completed_results():
             yield result
@@ -339,9 +369,14 @@ class StreamingToolExecutor:
         """
         # Apply all pending context modifiers from completed tools
         for tool in self._tools:
-            if tool.status == ToolStatus.COMPLETED and tool.context_modifiers:
+            if (
+                tool.status == ToolStatus.COMPLETED
+                and tool.context_modifiers
+                and not tool.context_modifiers_applied
+            ):
                 for modifier in tool.context_modifiers:
                     self._context = modifier(self._context)
+                tool.context_modifiers_applied = True
         return self._context
 
     def _has_unfinished_tools(self) -> bool:
@@ -355,16 +390,3 @@ class StreamingToolExecutor:
 
     def _has_pending_progress(self) -> bool:
         return any(t.pending_progress for t in self._tools)
-
-
-def create_child_abort_controller(parent: "AbortController") -> "AbortController":
-    from claude_core.utils.abort import AbortController
-
-    child = AbortController()
-
-    def propagate_to_parent():
-        if not parent.signal.aborted:
-            parent.abort(child.signal.reason or "child_abort")
-
-    child.signal.add_event_listener("abort", propagate_to_parent)
-    return child

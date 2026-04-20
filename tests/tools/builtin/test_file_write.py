@@ -2,6 +2,7 @@ import pytest
 import asyncio
 import tempfile
 import os
+from pathlib import Path
 from claude_core.tools.builtin.file_write import create_file_write_tool
 from claude_core.tools.base import ToolResult
 from claude_core.models.tool import ToolUseContext, ToolUseContextOptions
@@ -17,7 +18,9 @@ def context():
 @pytest.mark.asyncio
 async def test_file_write_basic(context):
     tool = create_file_write_tool()
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+    workspace = Path.cwd() / ".pytest_tmp"
+    workspace.mkdir(exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, dir=workspace) as f:
         temp_path = f.name
     try:
         result = await tool.call(
@@ -35,7 +38,9 @@ async def test_file_write_basic(context):
 @pytest.mark.asyncio
 async def test_file_write_overwrite(context):
     tool = create_file_write_tool()
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+    workspace = Path.cwd() / ".pytest_tmp"
+    workspace.mkdir(exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, dir=workspace) as f:
         f.write("Original content")
         temp_path = f.name
     try:

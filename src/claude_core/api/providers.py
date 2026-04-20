@@ -1,9 +1,4 @@
-"""API Provider abstraction layer.
-
-This module provides a provider interface that allows QueryEngine
-to work with different LLM backends (OpenAI-compatible, Anthropic, etc.)
-without direct dependency on specific client implementations.
-"""
+"""Provider abstractions and adapters for LLM request construction."""
 
 from __future__ import annotations
 
@@ -11,14 +6,22 @@ import asyncio
 import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, AsyncGenerator
+from typing import Any, AsyncGenerator, Protocol
 
-from claude_core.api.errors import APIError, RateLimitError, AuthenticationError, InvalidRequestError, APIConnectionError, is_retryable_error
+from claude_core.api.errors import (
+    APIConnectionError,
+    APIError,
+    AuthenticationError,
+    InvalidRequestError,
+    RateLimitError,
+    is_retryable_error,
+)
 
 
 @dataclass
 class ProviderConfig:
-    """Configuration for an API provider."""
+    """Configuration for a provider-backed client."""
+
     base_url: str
     api_key: str
     model: str
@@ -28,23 +31,17 @@ class ProviderConfig:
 
 
 class LLMProvider(ABC):
-    """
-    Abstract base class for LLM providers.
-
-    Implement this interface to add support for different LLM backends.
-    """
+    """Abstract provider interface used by the engine layer."""
 
     @property
     @abstractmethod
     def config(self) -> ProviderConfig:
-        """Get the provider configuration."""
-        pass
+        ...
 
     @property
     @abstractmethod
     def model(self) -> str:
-        """Get the model name."""
-        pass
+        ...
 
     @abstractmethod
     async def chat_completion(
@@ -53,13 +50,7 @@ class LLMProvider(ABC):
         tools: list[dict] | None = None,
         **kwargs: Any,
     ) -> dict:
-        """
-        Make a non-streaming chat completion request.
-
-        Returns:
-            Chat completion response dict
-        """
-        pass
+        ...
 
     @abstractmethod
     async def chat_completion_stream(
@@ -68,31 +59,15 @@ class LLMProvider(ABC):
         tools: list[dict] | None = None,
         **kwargs: Any,
     ) -> AsyncGenerator[dict, None]:
-        """
-        Make a streaming chat completion request.
-
-        Yields:
-            Stream events as dicts with keys like:
-            - content_block_delta: delta content from streaming
-            - tool_use: tool call from streaming
-            - message_stop: end of message
-            - usage: token usage information
-        """
-        pass
+        ...
 
     @abstractmethod
     async def close(self) -> None:
-        """Close the provider and cleanup resources."""
-        pass
+        ...
 
 
 class OpenAIProvider(LLMProvider):
-    """
-    OpenAI-compatible provider implementation.
-
-    Supports any API that implements the OpenAI Chat Completions protocol,
-    including Ollama, vLLM, DeepSeek, Azure OpenAI, etc.
-    """
+    """OpenAI-compatible provider implementation."""
 
     def __init__(self, config: ProviderConfig):
         self._config = config
@@ -107,14 +82,12 @@ class OpenAIProvider(LLMProvider):
         return self._config.model
 
     def _build_headers(self) -> dict[str, str]:
-        """Build request headers."""
         return {
             "Authorization": f"Bearer {self._config.api_key}",
             "Content-Type": "application/json",
         }
 
     def _map_status_to_error(self, response: Any) -> APIError:
-        """Map HTTP status code to appropriate error type."""
         status = response.status_code
         try:
             data = response.json()
@@ -124,22 +97,21 @@ class OpenAIProvider(LLMProvider):
 
         if status == 401:
             return AuthenticationError(error_msg)
-        elif status == 403:
+        if status == 403:
             return AuthenticationError("Access forbidden")
-        elif status == 400:
+        if status == 400:
             return InvalidRequestError(error_msg, body=response.json() if response.content else None)
-        elif status == 429:
+        if status == 429:
             retry_after = response.headers.get("retry-after")
             return RateLimitError(error_msg, retry_after=int(retry_after) if retry_after else None)
-        elif status >= 500:
+        if status >= 500:
             return APIConnectionError(f"Server error: {error_msg}")
-        else:
-            return APIError(f"HTTP {status}: {error_msg}", status_code=status)
+        return APIError(f"HTTP {status}: {error_msg}", status_code=status)
 
     async def _get_client(self) -> Any:
-        """Get or create the HTTP client."""
         if self._client is None:
             import httpx
+
             self._client = httpx.AsyncClient(timeout=self._config.timeout)
         return self._client
 
@@ -149,7 +121,6 @@ class OpenAIProvider(LLMProvider):
         tools: list[dict] | None = None,
         **kwargs: Any,
     ) -> dict:
-        """Make a non-streaming chat completion request with retry logic."""
         client = await self._get_client()
         url = f"{self._config.base_url}/chat/completions"
 
@@ -181,17 +152,16 @@ class OpenAIProvider(LLMProvider):
 
                     if attempt < self._config.max_retries - 1:
                         await asyncio.sleep(retry_delay)
-                        retry_delay *= 2  # Exponential backoff
+                        retry_delay *= 2
                         continue
-                    else:
-                        raise error
+                    raise error
 
                 return response.json()
 
             except APIError:
                 raise
-            except Exception as e:
-                last_error = APIConnectionError(f"Connection error: {str(e)}")
+            except Exception as exc:
+                last_error = APIConnectionError(f"Connection error: {str(exc)}")
                 if attempt < self._config.max_retries - 1:
                     await asyncio.sleep(retry_delay)
                     retry_delay *= 2
@@ -206,10 +176,6 @@ class OpenAIProvider(LLMProvider):
         tools: list[dict] | None = None,
         **kwargs: Any,
     ) -> AsyncGenerator[dict, None]:
-        """Make a streaming chat completion request.
-
-        Yields parsed SSE events including usage information.
-        """
         client = await self._get_client()
         url = f"{self._config.base_url}/chat/completions"
 
@@ -244,132 +210,118 @@ class OpenAIProvider(LLMProvider):
                             await asyncio.sleep(retry_delay)
                             retry_delay *= 2
                             continue
-                        else:
-                            raise error
+                        raise error
 
-                    # Track usage from streaming response
                     prompt_tokens = 0
                     completion_tokens = 0
                     usage_recorded = False
-
-                    # Buffer for streaming tool calls
-                    buffered_tool_call: Any | None = None
+                    buffered_tool_calls: dict[int, Any] = {}
 
                     async for line in response.aiter_lines():
                         line = line.strip()
                         if not line or line.startswith("#"):
                             continue
 
-                        if line.startswith("data: "):
-                            data = line[6:]
-                            if data == "[DONE]":
-                                # Yield any remaining buffered tool call
-                                if buffered_tool_call and buffered_tool_call.id:
-                                    try:
-                                        yield {
-                                            "type": "tool_use",
-                                            "tool_use_id": buffered_tool_call.id,
-                                            "name": buffered_tool_call.name,
-                                            "input": json.loads(
-                                                buffered_tool_call.arguments or "{}"
-                                            ),
-                                        }
-                                    except json.JSONDecodeError:
-                                        yield {
-                                            "type": "tool_use",
-                                            "tool_use_id": buffered_tool_call.id,
-                                            "name": buffered_tool_call.name,
-                                            "input": {},
-                                        }
-                                # Yield usage at end of stream
-                                if not usage_recorded:
-                                    yield {
-                                        "type": "usage",
-                                        "prompt_tokens": prompt_tokens,
-                                        "completion_tokens": completion_tokens,
-                                    }
-                                yield {"type": "message_stop"}
-                                break
+                        if not line.startswith("data: "):
+                            continue
 
-                            try:
-                                chunk = json.loads(data)
-                            except json.JSONDecodeError:
-                                continue
-
-                            # Extract usage from chunk if available
-                            if "usage" in chunk and not usage_recorded:
-                                usage_data = chunk["usage"]
-                                prompt_tokens = usage_data.get("prompt_tokens", 0)
-                                completion_tokens = usage_data.get("completion_tokens", 0)
-                                usage_recorded = True
+                        data = line[6:]
+                        if data == "[DONE]":
+                            for index in sorted(buffered_tool_calls):
+                                buffered = buffered_tool_calls[index]
+                                if not buffered.id:
+                                    continue
+                                try:
+                                    tool_input = json.loads(buffered.arguments or "{}")
+                                except json.JSONDecodeError:
+                                    tool_input = {}
+                                yield {
+                                    "type": "tool_use",
+                                    "tool_use_id": buffered.id,
+                                    "name": buffered.name,
+                                    "input": tool_input,
+                                }
+                            if not usage_recorded:
                                 yield {
                                     "type": "usage",
                                     "prompt_tokens": prompt_tokens,
                                     "completion_tokens": completion_tokens,
                                 }
+                            yield {"type": "message_stop"}
+                            break
 
-                            # Parse OpenAI chat completion chunk
-                            if "choices" in chunk:
-                                for choice in chunk["choices"]:
-                                    delta = choice.get("delta", {})
+                        try:
+                            chunk = json.loads(data)
+                        except json.JSONDecodeError:
+                            continue
 
-                                    # Content delta
-                                    if delta.get("content"):
-                                        yield {
-                                            "type": "content_block_delta",
-                                            "index": choice.get("index", 0),
-                                            "delta": {"content": delta["content"]},
-                                        }
+                        if "usage" in chunk and not usage_recorded:
+                            usage_data = chunk["usage"]
+                            prompt_tokens = usage_data.get("prompt_tokens", 0)
+                            completion_tokens = usage_data.get("completion_tokens", 0)
+                            usage_recorded = True
+                            yield {
+                                "type": "usage",
+                                "prompt_tokens": prompt_tokens,
+                                "completion_tokens": completion_tokens,
+                            }
 
-                                    # Tool use - buffer the streaming arguments
-                                    if delta.get("tool_calls"):
-                                        for tc in delta["tool_calls"]:
-                                            if buffered_tool_call is None:
-                                                buffered_tool_call = type(
-                                                    "BufferedToolCall",
-                                                    (),
-                                                    {"id": "", "name": "", "arguments": ""}
-                                                )()
+                        if "choices" not in chunk:
+                            continue
 
-                                            # Update tool call info
-                                            if tc.get("id"):
-                                                buffered_tool_call.id = tc["id"]
-                                            if tc.get("function", {}).get("name"):
-                                                buffered_tool_call.name = tc["function"]["name"]
-                                            if tc.get("function", {}).get("arguments"):
-                                                buffered_tool_call.arguments += tc["function"]["arguments"]
+                        for choice in chunk["choices"]:
+                            delta = choice.get("delta", {})
 
-                                    # Finish reason
-                                    if choice.get("finish_reason"):
-                                        # Yield buffered tool call if present
-                                        if buffered_tool_call and buffered_tool_call.id:
-                                            try:
-                                                yield {
-                                                    "type": "tool_use",
-                                                    "tool_use_id": buffered_tool_call.id,
-                                                    "name": buffered_tool_call.name,
-                                                    "input": json.loads(
-                                                        buffered_tool_call.arguments or "{}"
-                                                    ),
-                                                }
-                                            except json.JSONDecodeError:
-                                                yield {
-                                                    "type": "tool_use",
-                                                    "tool_use_id": buffered_tool_call.id,
-                                                    "name": buffered_tool_call.name,
-                                                    "input": {},
-                                                }
-                                            buffered_tool_call = None
+                            if delta.get("content"):
+                                yield {
+                                    "type": "content_block_delta",
+                                    "index": choice.get("index", 0),
+                                    "delta": {"content": delta["content"]},
+                                }
 
-                                        yield {"type": "message_stop"}
+                            if delta.get("tool_calls"):
+                                for tc in delta["tool_calls"]:
+                                    index = tc.get("index", 0)
+                                    if index not in buffered_tool_calls:
+                                        buffered_tool_calls[index] = type(
+                                            "BufferedToolCall",
+                                            (),
+                                            {"id": "", "name": "", "arguments": ""},
+                                        )()
 
-                # Successfully streamed
+                                    buffered = buffered_tool_calls[index]
+                                    if tc.get("id"):
+                                        buffered.id = tc["id"]
+                                    function = tc.get("function", {})
+                                    if function.get("name"):
+                                        buffered.name = function["name"]
+                                    if function.get("arguments"):
+                                        buffered.arguments += function["arguments"]
+
+                            if choice.get("finish_reason"):
+                                for index in sorted(buffered_tool_calls):
+                                    buffered = buffered_tool_calls[index]
+                                    if not buffered.id:
+                                        continue
+                                    try:
+                                        tool_input = json.loads(buffered.arguments or "{}")
+                                    except json.JSONDecodeError:
+                                        tool_input = {}
+                                    yield {
+                                        "type": "tool_use",
+                                        "tool_use_id": buffered.id,
+                                        "name": buffered.name,
+                                        "input": tool_input,
+                                    }
+                                buffered_tool_calls.clear()
+                                yield {"type": "message_stop"}
+
                 return
 
             except APIError:
                 raise
-            except Exception as e:
-                last_error = APIConnectionError(f"Connection error: {str(e)}")
+            except Exception as exc:
+                last_error = APIConnectionError(f"Connection error: {str(exc)}")
                 if attempt < self._config.max_retries - 1:
                     await asyncio.sleep(retry_delay)
                     retry_delay *= 2
@@ -379,18 +331,13 @@ class OpenAIProvider(LLMProvider):
         raise last_error or APIError("Max retries exceeded")
 
     async def close(self) -> None:
-        """Close the HTTP client."""
         if self._client:
             await self._client.aclose()
             self._client = None
 
 
 class MockProvider(LLMProvider):
-    """
-    Mock provider for testing purposes.
-
-    Returns predefined responses without making actual API calls.
-    """
+    """Mock provider for tests."""
 
     def __init__(self, config: ProviderConfig):
         self._config = config
@@ -407,12 +354,10 @@ class MockProvider(LLMProvider):
         return self._config.model
 
     def set_responses(self, responses: list[dict]) -> None:
-        """Set predefined non-streaming responses."""
         self._responses = responses
         self._stream_index = 0
 
     def set_stream_responses(self, responses: list[dict]) -> None:
-        """Set predefined streaming responses (list of events)."""
         self._stream_responses = responses
         self._stream_index = 0
 
@@ -422,7 +367,6 @@ class MockProvider(LLMProvider):
         tools: list[dict] | None = None,
         **kwargs: Any,
     ) -> dict:
-        """Return a predefined non-streaming response."""
         if self._responses:
             return self._responses[0]
         return {
@@ -445,13 +389,11 @@ class MockProvider(LLMProvider):
         tools: list[dict] | None = None,
         **kwargs: Any,
     ) -> AsyncGenerator[dict, None]:
-        """Yield predefined streaming responses."""
         if self._stream_responses:
             for response in self._stream_responses:
                 yield response
             return
 
-        # Default mock streaming response
         yield {"type": "content_block_delta", "index": 0, "delta": {"content": "This "}}
         yield {"type": "content_block_delta", "index": 0, "delta": {"content": "is "}}
         yield {"type": "content_block_delta", "index": 0, "delta": {"content": "a "}}
@@ -461,37 +403,98 @@ class MockProvider(LLMProvider):
         yield {"type": "message_stop"}
 
     async def close(self) -> None:
-        """No-op for mock provider."""
         pass
 
 
-# Provider registry for looking up providers by name
+class ProviderAdapter(Protocol):
+    """Interface for provider-specific request construction."""
+
+    name: str
+    default_base_url: str
+
+    def build_headers(self, api_key: str) -> dict[str, str]:
+        ...
+
+    def build_chat_completions_url(self, base_url: str) -> str:
+        ...
+
+    def build_request_body(
+        self,
+        *,
+        model: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        stream: bool = False,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        ...
+
+
+@dataclass(frozen=True)
+class OpenAIProviderAdapter:
+    """Default OpenAI-compatible request adapter."""
+
+    name: str = "openai"
+    default_base_url: str = "https://api.openai.com/v1"
+
+    def build_headers(self, api_key: str) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+
+    def build_chat_completions_url(self, base_url: str) -> str:
+        return f"{base_url.rstrip('/')}/chat/completions"
+
+    def build_request_body(
+        self,
+        *,
+        model: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        stream: bool = False,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "stream": stream,
+            **kwargs,
+        }
+        if tools:
+            body["tools"] = tools
+        return body
+
+
+@dataclass(frozen=True)
+class GeminiProviderAdapter(OpenAIProviderAdapter):
+    """Gemini OpenAI-compatible endpoint adapter."""
+
+    name: str = "gemini"
+    default_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai"
+
+
 _PROVIDERS: dict[str, type[LLMProvider]] = {
     "openai": OpenAIProvider,
     "openai-compatible": OpenAIProvider,
     "mock": MockProvider,
 }
 
+PROVIDERS: dict[str, ProviderAdapter] = {
+    "openai": OpenAIProviderAdapter(),
+    "gemini": GeminiProviderAdapter(),
+}
+
 
 def register_provider(name: str, provider_class: type[LLMProvider]) -> None:
     """Register a provider class by name."""
+
     _PROVIDERS[name.lower()] = provider_class
 
 
-def create_provider(
-    name: str | None,
-    config: ProviderConfig,
-) -> LLMProvider:
-    """
-    Create a provider instance by name.
+def create_provider(name: str | None, config: ProviderConfig) -> LLMProvider:
+    """Create a provider instance by name."""
 
-    Args:
-        name: Provider name (e.g., "openai", "anthropic"). If None, uses OpenAI-compatible.
-        config: Provider configuration
-
-    Returns:
-        LLMProvider instance
-    """
     if name is None:
         name = "openai-compatible"
 
@@ -500,3 +503,13 @@ def create_provider(
         raise ValueError(f"Unknown provider: {name}. Available: {list(_PROVIDERS.keys())}")
 
     return provider_class(config)
+
+
+def get_provider_adapter(name: str) -> ProviderAdapter:
+    """Resolve a provider adapter by name."""
+
+    normalized = name.strip().lower()
+    if normalized not in PROVIDERS:
+        available = ", ".join(sorted(PROVIDERS))
+        raise ValueError(f"Unknown provider '{name}'. Available providers: {available}")
+    return PROVIDERS[normalized]

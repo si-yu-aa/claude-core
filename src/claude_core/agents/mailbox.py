@@ -10,6 +10,7 @@ from collections import deque
 class MailboxMessage:
     """A message in the mailbox."""
     sender_id: str
+    recipient_id: str
     content: Any
     timestamp: float = 0.0
 
@@ -24,11 +25,16 @@ class Mailbox:
         self._messages: deque[MailboxMessage] = deque()
         self._subscribers: dict[str, Any] = {}
 
-    def send(self, sender_id: str, content: Any) -> None:
+    def send(self, sender_id: str, recipient_id: str, content: Any | None = None) -> None:
         """Send a message to the mailbox."""
         from time import time
+        if content is None:
+            # Backwards-compatible form: send(sender_id, content)
+            content = recipient_id
+            recipient_id = "*"
         msg = MailboxMessage(
             sender_id=sender_id,
+            recipient_id=recipient_id,
             content=content,
             timestamp=time(),
         )
@@ -36,11 +42,23 @@ class Mailbox:
 
     def receive(self, recipient_id: str) -> MailboxMessage | None:
         """Receive a message for a specific recipient."""
-        while self._messages:
+        for _ in range(len(self._messages)):
             msg = self._messages.popleft()
-            # Simple implementation: any message is for anyone
-            return msg
+            if msg.recipient_id in {"*", recipient_id}:
+                return msg
+            self._messages.append(msg)
         return None
+
+    def pending_count(self, recipient_id: str) -> int:
+        """Count messages pending for a recipient."""
+        return sum(1 for msg in self._messages if msg.recipient_id in {"*", recipient_id})
+
+    def list_messages(self, recipient_id: str | None = None) -> list[MailboxMessage]:
+        """Return mailbox messages, optionally filtered by recipient."""
+        messages = list(self._messages)
+        if recipient_id is None:
+            return messages
+        return [msg for msg in messages if msg.recipient_id in {"*", recipient_id}]
 
     def peek(self) -> MailboxMessage | None:
         """Peek at the next message without removing it."""

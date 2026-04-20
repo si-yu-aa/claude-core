@@ -28,6 +28,9 @@ class ToolUseContext:
     messages: list["Message"] = field(default_factory=list)
     agent_id: Optional[str] = None
     query_tracking: Optional["QueryChainTracking"] = None
+    provider: Optional[str] = None
+    base_url: Optional[str] = None
+    api_key: Optional[str] = None
 
 @dataclass
 class ToolUseContextOptions:
@@ -46,6 +49,8 @@ class ToolUseContextOptions:
     custom_system_prompt: Optional[str] = None
     append_system_prompt: Optional[str] = None
     refresh_tools: Optional[Callable[[], list["ToolDefinition"]]] = None
+    permission_context: Optional["ToolPermissionContext"] = None
+    task_store_path: Optional[str] = None
 
 @dataclass
 class QueryChainTracking:

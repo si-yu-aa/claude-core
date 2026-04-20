@@ -7,6 +7,10 @@ from claude_core.tools.base import (
     build_tool,
 )
 from claude_core.models.tool import ToolUseContext, ToolPermissionContext
+from claude_core.tools.permissions import (
+    build_permission_checker,
+    normalize_file_path,
+)
 
 
 class TestToolPermissionContext:
@@ -73,11 +77,13 @@ class TestPermissionResult:
         result = PermissionResult(behavior="allow")
         assert result.behavior == "allow"
         assert result.updated_input is None
+        assert result.message is None
         assert result.decision_classification is None
 
     def test_permission_result_deny(self):
-        result = PermissionResult(behavior="deny")
+        result = PermissionResult(behavior="deny", message="blocked")
         assert result.behavior == "deny"
+        assert result.message == "blocked"
 
     def test_permission_result_ask(self):
         result = PermissionResult(behavior="ask")
@@ -144,7 +150,7 @@ class TestToolPermissions:
 
     @pytest.mark.asyncio
     async def test_default_permissions_allow(self, tool_without_permissions, mock_context):
-        """Test that default permissions always return 'allow'."""
+        """Test that tools without custom hooks still default to allow."""
         result = await tool_without_permissions.check_permissions(
             {"any": "data"},
             mock_context
@@ -229,3 +235,98 @@ class TestBuildToolWithPermissions:
 
         assert tool2.check_permissions is not original_check
         assert tool2.check_permissions is custom_check
+
+
+class TestPermissionHelpers:
+    @pytest.fixture
+    def secure_context(self):
+        ctx = MagicMock(spec=ToolUseContext)
+        ctx.options = MagicMock()
+        ctx.options.permission_context = ToolPermissionContext(
+            always_allow_rules=["file:read:/workspace/docs/**"]
+        )
+        return ctx
+
+    @pytest.mark.asyncio
+    async def test_permission_checker_secure_by_default_without_context(self):
+        checker = build_permission_checker(
+            lambda args: {"rule": "file:read"},
+            "file_read",
+        )
+        ctx = MagicMock(spec=ToolUseContext)
+        ctx.options = MagicMock()
+        ctx.options.permission_context = None
+
+        result = await checker({"file_path": "README.md"}, ctx)
+
+        assert result.behavior == "ask"
+
+    @pytest.mark.asyncio
+    async def test_permission_checker_requires_explicit_allow(self):
+        checker = build_permission_checker(
+            lambda args: {"rule": "file:write"},
+            "file_write",
+        )
+        ctx = MagicMock(spec=ToolUseContext)
+        ctx.options = MagicMock()
+        ctx.options.permission_context = ToolPermissionContext()
+
+        result = await checker({"file_path": "README.md"}, ctx)
+
+        assert result.behavior == "ask"
+
+    @pytest.mark.asyncio
+    async def test_permission_checker_supports_path_scoped_rules(self, secure_context):
+        checker = build_permission_checker(
+            lambda args: {
+                "rule": "file:read",
+                "path": "/workspace/docs/readme.md",
+                "updated_input": {"file_path": "/workspace/docs/readme.md"},
+            },
+            "file_read",
+        )
+
+        result = await checker({"file_path": "docs/readme.md"}, secure_context)
+
+        assert result.behavior == "allow"
+        assert result.updated_input == {"file_path": "/workspace/docs/readme.md"}
+
+    @pytest.mark.asyncio
+    async def test_permission_checker_denies_matching_path_rule(self):
+        checker = build_permission_checker(
+            lambda args: {
+                "rule": "file:edit",
+                "path": "/workspace/secrets.txt",
+            },
+            "file_edit",
+        )
+        ctx = MagicMock(spec=ToolUseContext)
+        ctx.options = MagicMock()
+        ctx.options.permission_context = ToolPermissionContext(
+            deny_rules=["file:edit:/workspace/secrets.txt"]
+        )
+
+        result = await checker({"file_path": "/workspace/secrets.txt"}, ctx)
+
+        assert result.behavior == "deny"
+
+
+class TestNormalizeFilePath:
+    def test_normalize_file_path_resolves_relative_path_inside_workspace(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        docs_dir = tmp_path / "docs"
+        docs_dir.mkdir()
+
+        normalized = normalize_file_path("docs/../docs/readme.txt")
+
+        assert normalized == str((docs_dir / "readme.txt").resolve())
+
+    def test_normalize_file_path_rejects_escape_from_workspace(self, tmp_path, monkeypatch):
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        outside = tmp_path / "outside.txt"
+        outside.write_text("x")
+        monkeypatch.chdir(workspace)
+
+        with pytest.raises(PermissionError):
+            normalize_file_path("../outside.txt")

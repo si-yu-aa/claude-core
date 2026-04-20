@@ -3,14 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import shlex
 from typing import Callable, TYPE_CHECKING
 
 from claude_core.tools.base import Tool, ToolResult, build_tool
+from claude_core.tools.permissions import build_permission_checker
 
 if TYPE_CHECKING:
     from claude_core.models.tool import ToolUseContext
 
 TIMEOUT_SECONDS = 60
+READ_ONLY_COMMANDS = {"ls", "cat", "head", "tail", "grep", "find", "pwd", "echo"}
+SHELL_WRITE_TOKENS = ("|", ">", ";", "&", "`", "$(", "<<")
+FIND_WRITE_FLAGS = {"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprintf", "-fls"}
 
 def create_bash_tool() -> Tool:
     async def call(
@@ -30,24 +36,57 @@ def create_bash_tool() -> Tool:
             )
 
         try:
-            result = await asyncio.wait_for(
-                asyncio.create_subprocess_shell(
-                    command,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                ),
-                timeout=timeout,
+            process = await asyncio.create_subprocess_shell(
+                command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
 
-            stdout, stderr = await result.communicate()
+            abort_future = asyncio.get_event_loop().create_future()
+
+            def on_abort() -> None:
+                if not abort_future.done():
+                    abort_future.set_result(context.abort_controller.signal.reason or "aborted")
+
+            context.abort_controller.signal.add_event_listener("abort", on_abort)
+
+            communicate_task = asyncio.create_task(process.communicate())
+
+            try:
+                done, pending = await asyncio.wait(
+                    [communicate_task, abort_future],
+                    timeout=timeout,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if abort_future in done:
+                    communicate_task.cancel()
+                    await _terminate_process(process)
+                    return ToolResult(
+                        tool_use_id=args.get("tool_use_id", ""),
+                        content=f"Command aborted: {abort_future.result()}",
+                        is_error=True,
+                    )
+                if communicate_task in done:
+                    stdout, stderr = await communicate_task
+                else:
+                    communicate_task.cancel()
+                    await _terminate_process(process)
+                    return ToolResult(
+                        tool_use_id=args.get("tool_use_id", ""),
+                        content=f"Command timed out after {timeout} seconds",
+                        is_error=True,
+                    )
+            except asyncio.CancelledError:
+                await _terminate_process(process)
+                raise
 
             output = stdout.decode() if stdout else ""
             error_output = stderr.decode() if stderr else ""
 
-            if result.returncode != 0:
+            if process.returncode != 0:
                 return ToolResult(
                     tool_use_id=args.get("tool_use_id", ""),
-                    content=f"Command failed with exit code {result.returncode}:\n{error_output or output}",
+                    content=f"Command failed with exit code {process.returncode}:\n{error_output or output}",
                     is_error=True,
                 )
 
@@ -57,12 +96,6 @@ def create_bash_tool() -> Tool:
                 is_error=False,
             )
 
-        except asyncio.TimeoutError:
-            return ToolResult(
-                tool_use_id=args.get("tool_use_id", ""),
-                content=f"Command timed out after {timeout} seconds",
-                is_error=True,
-            )
         except Exception as e:
             return ToolResult(
                 tool_use_id=args.get("tool_use_id", ""),
@@ -75,8 +108,29 @@ def create_bash_tool() -> Tool:
 
     def is_read_only(args: dict) -> bool:
         command = args.get("command", "")
-        read_only_commands = ["ls", "cat", "head", "tail", "grep", "find", "pwd", "echo"]
-        return any(command.strip().startswith(cmd) for cmd in read_only_commands)
+        stripped = command.strip()
+        if not stripped:
+            return False
+
+        if any(token in stripped for token in SHELL_WRITE_TOKENS):
+            return False
+
+        try:
+            parts = shlex.split(stripped, posix=True)
+        except ValueError:
+            return False
+
+        if not parts:
+            return False
+
+        executable = os.path.basename(parts[0])
+        if executable not in READ_ONLY_COMMANDS:
+            return False
+
+        if any(part in FIND_WRITE_FLAGS or part.startswith("-exec") for part in parts[1:]):
+            return False
+
+        return True
 
     def interrupt_behavior() -> str:
         return "cancel"
@@ -103,4 +157,21 @@ def create_bash_tool() -> Tool:
         "is_concurrency_safe": is_concurrency_safe,
         "is_read_only": is_read_only,
         "interrupt_behavior": interrupt_behavior,
+        "check_permissions": build_permission_checker(
+            lambda args: "bash:read" if is_read_only(args) else "bash:exec",
+            "bash_command",
+        ),
     })
+
+
+async def _terminate_process(process: asyncio.subprocess.Process) -> None:
+    """Best-effort process termination used by timeout and abort paths."""
+    if process.returncode is not None:
+        return
+
+    process.terminate()
+    try:
+        await asyncio.wait_for(process.wait(), timeout=2)
+    except asyncio.TimeoutError:
+        process.kill()
+        await process.wait()

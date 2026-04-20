@@ -7,9 +7,22 @@ import os
 import difflib
 
 from claude_core.tools.base import Tool, ToolResult, build_tool
+from claude_core.tools.permissions import build_permission_checker, normalize_file_path
 
 if TYPE_CHECKING:
     from claude_core.models.tool import ToolUseContext
+
+
+def _resolve_edit_permission(args: dict) -> dict:
+    file_path = normalize_file_path(args.get("file_path", ""))
+    return {
+        "rule": "file:edit",
+        "path": file_path,
+        "updated_input": {
+            **args,
+            "file_path": file_path,
+        },
+    }
 
 def create_file_edit_tool() -> Tool:
     async def call(
@@ -26,6 +39,15 @@ def create_file_edit_tool() -> Tool:
             return ToolResult(
                 tool_use_id=args.get("tool_use_id", ""),
                 content="Error: file_path is required",
+                is_error=True,
+            )
+
+        try:
+            file_path = normalize_file_path(file_path)
+        except PermissionError as e:
+            return ToolResult(
+                tool_use_id=args.get("tool_use_id", ""),
+                content=f"Error editing file: {str(e)}",
                 is_error=True,
             )
 
@@ -97,4 +119,8 @@ def create_file_edit_tool() -> Tool:
         },
         "call": call,
         "is_concurrency_safe": is_concurrency_safe,
+        "check_permissions": build_permission_checker(
+            _resolve_edit_permission,
+            "file_edit",
+        ),
     })

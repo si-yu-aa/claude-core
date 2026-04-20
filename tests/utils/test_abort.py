@@ -35,5 +35,29 @@ async def test_child_abort_controller_own_abort():
     child.abort("child_reason")
     assert child.signal.aborted
     assert child.signal.reason == "child_reason"
-    # Parent should also be aborted
-    assert parent.signal.aborted
+    # Child lifecycle changes must not abort the parent session.
+    assert parent.signal.aborted is False
+
+
+@pytest.mark.asyncio
+async def test_child_abort_controller_fast_path_when_parent_already_aborted():
+    parent = AbortController()
+    parent.abort("already_done")
+
+    child = create_child_abort_controller(parent)
+
+    assert child.signal.aborted is True
+    assert child.signal.reason == "already_done"
+    assert len(parent.signal._callbacks) == 0
+
+
+@pytest.mark.asyncio
+async def test_child_abort_controller_cleans_parent_listener_on_child_abort():
+    parent = AbortController()
+    child = create_child_abort_controller(parent)
+
+    assert len(parent.signal._callbacks) == 1
+
+    child.abort("child_done")
+
+    assert len(parent.signal._callbacks) == 0

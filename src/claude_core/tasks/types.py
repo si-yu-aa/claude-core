@@ -1,135 +1,210 @@
-"""Task types for agent background tasks."""
+"""Task state models for subagent and background agent execution."""
 
 from __future__ import annotations
 
+import asyncio
+import time
+import uuid
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Optional
-import uuid
+
+_UNSET = object()
 
 
 class TaskType(Enum):
-    """Types of background tasks."""
+    """Supported task categories."""
+
     LOCAL_SHELL = "local_shell"
-    SUBAGENT = "subagent"
     LOCAL_AGENT = "local_agent"
+    SUBAGENT = "subagent"
+    BACKGROUND_AGENT = "background_agent"
 
 
 class TaskStatus(Enum):
-    """Status of a background task."""
+    """Task lifecycle states."""
+
     PENDING = "pending"
     RUNNING = "running"
+    STOPPED = "stopped"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
 
 
 @dataclass
-class LocalShellTaskState:
-    """State for local shell task."""
-    task_type: TaskType = TaskType.LOCAL_SHELL
-    subject: str = ""
+class TaskState:
+    """Base task state shared by all task kinds."""
+
+    id: str
+    task_type: TaskType
+    status: str
+    subject: str
+    description: str
+    owner: Optional[str] = None
+    created_at: float = 0.0
+    started_at: Optional[float] = None
+    completed_at: Optional[float] = None
+    result: Optional[str] = None
+    error: Optional[str] = None
+
+
+@dataclass
+class LocalShellTaskState(TaskState):
+    """Task state for local shell execution."""
+
     command: str = ""
     working_dir: Optional[str] = None
 
 
 @dataclass
-class SubagentTaskState:
-    """State for subagent task."""
-    task_type: TaskType = TaskType.SUBAGENT
-    subject: str = ""
+class SubagentTaskState(TaskState):
+    """Task state for foreground subagent execution."""
+
+    agent_id: str = ""
     agent_name: str = ""
+    model: str = "default"
+    prompt: str = ""
     run_in_background: bool = False
     parent_agent_id: Optional[str] = None
 
 
 @dataclass
-class TaskState:
-    """Generic task state container."""
-    id: str
-    task_type: TaskType
-    subject: str
-    status: TaskStatus = TaskStatus.PENDING
-    result: Any = None
-    error: Optional[str] = None
-    metadata: dict = None
+class BackgroundAgentTaskState(TaskState):
+    """Task state for background subagent execution."""
 
-    def __post_init__(self):
-        if self.metadata is None:
-            self.metadata = {}
+    agent_id: str = ""
+    agent_name: str = ""
+    model: str = "default"
+    is_backgrounded: bool = True
+
+
+def uuid_suffix() -> str:
+    """Small random suffix for task IDs."""
+
+    return uuid.uuid4().hex[:8]
 
 
 def create_task_id() -> str:
-    """Create a unique task ID."""
-    return f"task_{uuid.uuid4().hex[:12]}"
+    """Create a reasonably unique task identifier."""
+
+    return f"task-{int(time.time() * 1000)}-{uuid_suffix()}"
 
 
 def create_task_state(
     task_type: TaskType,
     subject: str,
-    **kwargs
+    description: str = "",
+    owner: Optional[str] = None,
+    **kwargs: Any,
 ) -> TaskState:
-    """Create a task state with the given type."""
+    """Factory for creating typed task states."""
+
     task_id = create_task_id()
+    common = dict(
+        id=task_id,
+        task_type=task_type,
+        status=TaskStatus.PENDING.value,
+        subject=subject,
+        description=description,
+        owner=owner,
+        created_at=time.time(),
+    )
 
     if task_type == TaskType.LOCAL_SHELL:
-        state = LocalShellTaskState(
-            task_type=task_type,
-            subject=subject,
-            command=kwargs.get("command", ""),
-            working_dir=kwargs.get("working_dir"),
-        )
-    elif task_type == TaskType.SUBAGENT:
-        state = SubagentTaskState(
-            task_type=task_type,
-            subject=subject,
-            agent_name=kwargs.get("agent_name", ""),
-            run_in_background=kwargs.get("run_in_background", False),
-            parent_agent_id=kwargs.get("parent_agent_id"),
-        )
-    else:
-        state = TaskState(
-            id=task_id,
-            task_type=task_type,
-            subject=subject,
-        )
-        return state
-
-    # Add common fields
-    state.id = task_id
-    return state
+        return LocalShellTaskState(**common, **kwargs)
+    if task_type == TaskType.BACKGROUND_AGENT:
+        return BackgroundAgentTaskState(**common, **kwargs)
+    if task_type == TaskType.SUBAGENT:
+        return SubagentTaskState(**common, **kwargs)
+    return TaskState(**common, **kwargs)
 
 
 class BackgroundTaskTracker:
-    """Tracker for background tasks (singleton)."""
+    """In-process tracker for task states and running asyncio tasks."""
 
-    _instance = None
+    _instance: BackgroundTaskTracker | None = None
 
-    def __init__(self):
-        self._tasks: dict[str, TaskState] = {}
+    def __init__(self) -> None:
+        self._states: dict[str, TaskState] = {}
+        self._tasks: dict[str, asyncio.Task[Any]] = {}
 
     @classmethod
     def get_instance(cls) -> BackgroundTaskTracker:
-        """Get the singleton instance."""
         if cls._instance is None:
             cls._instance = cls()
         return cls._instance
 
     def add_state(self, state: TaskState) -> None:
-        """Add a task state to the tracker."""
-        self._tasks[state.id] = state
+        self._states[state.id] = state
 
-    def get_state(self, task_id: str) -> TaskState | None:
-        """Get a task state by ID."""
-        return self._tasks.get(task_id)
-
-    def is_running(self, task_id: str) -> bool:
-        """Check if a task is running."""
+    def update_status(self, task_id: str, status: TaskStatus | str) -> None:
         state = self.get_state(task_id)
-        return state is not None and state.status == TaskStatus.RUNNING
+        if state is None:
+            return
+        state.status = status.value if isinstance(status, TaskStatus) else status
 
-    def update_status(self, task_id: str, status: TaskStatus) -> None:
-        """Update task status."""
-        state = self.get_state(task_id)
-        if state:
-            state.status = status
+    def list_states(self) -> list[TaskState]:
+        return list(self._states.values())
+
+    def get_state(self, task_id: str) -> Optional[TaskState]:
+        return self._states.get(task_id)
+
+    def get_state_by_agent(self, agent_id: str) -> Optional[TaskState]:
+        return next(
+            (state for state in self._states.values() if getattr(state, "agent_id", None) == agent_id),
+            None,
+        )
+
+    def start_task(self, agent_id: str, task: asyncio.Task[Any]) -> None:
+        self._tasks[agent_id] = task
+        task.add_done_callback(lambda done_task: self._clear_task_handle(agent_id, done_task))
+
+    def get_task(self, agent_id: str) -> Optional[asyncio.Task[Any]]:
+        return self._tasks.get(agent_id)
+
+    def is_running(self, agent_id: str) -> bool:
+        task = self._tasks.get(agent_id)
+        return task is not None and not task.done()
+
+    def remove(self, agent_id: str) -> None:
+        self._tasks.pop(agent_id, None)
+
+    def update_state_for_agent(
+        self,
+        agent_id: str,
+        *,
+        status: str,
+        result: Any = _UNSET,
+        error: Any = _UNSET,
+        completed_at: float | None = None,
+    ) -> Optional[TaskState]:
+        state = self.get_state_by_agent(agent_id)
+        if state is None:
+            return None
+
+        state.status = status
+        if result is not _UNSET:
+            state.result = result
+        if error is not _UNSET:
+            state.error = error
+        if completed_at is not None:
+            state.completed_at = completed_at
+
+        if status in {
+            TaskStatus.STOPPED.value,
+            TaskStatus.COMPLETED.value,
+            TaskStatus.FAILED.value,
+            TaskStatus.CANCELLED.value,
+        }:
+            self.remove(agent_id)
+        return state
+
+    def clear(self) -> None:
+        self._states.clear()
+        self._tasks.clear()
+
+    def _clear_task_handle(self, agent_id: str, done_task: asyncio.Task[Any]) -> None:
+        current = self._tasks.get(agent_id)
+        if current is done_task:
+            self._tasks.pop(agent_id, None)

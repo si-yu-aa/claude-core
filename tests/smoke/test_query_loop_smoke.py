@@ -76,7 +76,7 @@ class TestQueryLoopSmoke:
         from claude_core.engine.types import QueryState
 
         state = QueryState(messages=[], tool_use_context=None)
-        assert state.turn_count == 1
+        assert state.turn_count == 0
         assert state.stop_hook_active is None
 
     def test_query_params_defaults(self):

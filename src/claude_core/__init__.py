@@ -16,6 +16,10 @@ from claude_core.tools.base import Tool, ToolResult, ToolImpl, build_tool
 # API
 from claude_core.api.client import LLMClient
 from claude_core.api.errors import APIError, RateLimitError, AuthenticationError
+from claude_core.api.providers import get_provider_adapter
+
+# MCP
+from claude_core.mcp import MCPClient, MCPResource, MCPResourceContent
 
 __all__ = [
     # Version
@@ -39,4 +43,9 @@ __all__ = [
     "APIError",
     "RateLimitError",
     "AuthenticationError",
+    "get_provider_adapter",
+    # MCP
+    "MCPClient",
+    "MCPResource",
+    "MCPResourceContent",
 ]

@@ -117,30 +117,34 @@ def create_agent_tool() -> Tool:
                 is_backgrounded=True,
             )
             tracker.add_state(task_state)
+            task_state.status = TaskStatus.RUNNING.value
+            task_state.started_at = time.time()
 
-            # Create the async task
-            async def run_agent():
-                try:
-                    result = await agent.run(prompt)
-                    # Update task state with result
-                    task_state.status = result.status.value
-                    task_state.completed_at = time.time()
-                    task_state.result = result.final_response
-                    if result.status == AgentStatus.ERROR:
-                        task_state.error = result.final_response
-                    return result
-                except Exception as e:
-                    task_state.status = TaskStatus.FAILED.value if hasattr(TaskStatus, 'FAILED') else "failed"
-                    task_state.error = str(e)
-                    task_state.completed_at = time.time()
-                    raise
+            await agent.start_background(prompt)
+            task = getattr(agent, "_background_task", None)
+            if task is not None:
+                tracker.start_task(agent.agent_id, task)
 
-            task = asyncio.create_task(run_agent())
-            tracker.start_task(agent.agent_id, task)
+                def _sync_state(done_task: asyncio.Task) -> None:
+                    task_state.status = getattr(agent.status, "value", str(agent.status))
+                    task_state.completed_at = time.time()
+                    task_state.result = getattr(agent, "_final_response", "") or None
+                    if done_task.cancelled():
+                        task_state.error = "cancelled"
+                    else:
+                        exc = done_task.exception()
+                        if exc is not None:
+                            task_state.error = str(exc)
+
+                task.add_done_callback(_sync_state)
 
             return ToolResult(
                 tool_use_id=tool_use_id,
-                content=f"Background agent started: {agent.agent_id}",
+                content=(
+                    f"Background agent started\n"
+                    f"task_id: {task_state.id}\n"
+                    f"agent_id: {agent.agent_id}"
+                ),
                 is_error=False,
             )
         else:

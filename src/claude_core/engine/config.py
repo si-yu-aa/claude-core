@@ -7,9 +7,11 @@ from typing import Optional
 class QueryEngineConfig:
     """Configuration for QueryEngine."""
     api_key: str
+    provider: str = "openai"
     model: str = "gpt-4o"
-    base_url: str = "https://api.openai.com/v1"
+    base_url: Optional[str] = None
     max_turns: Optional[int] = None
+    fallback_model: Optional[str] = None
     max_output_tokens: Optional[int] = None
     temperature: float = 0.7
     timeout: float = 120.0

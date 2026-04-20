@@ -5,7 +5,7 @@ from typing import Any, Optional
 from dataclasses import dataclass
 
 from claude_core.agents.types import AgentConfig, AgentStatus, AgentResult
-from claude_core.agents.mailbox import Mailbox
+from claude_core.agents.runtime import AgentRuntime
 
 class BaseAgent(ABC):
     """
@@ -17,7 +17,7 @@ class BaseAgent(ABC):
     def __init__(self, config: AgentConfig):
         self.config = config
         self.status = AgentStatus.IDLE
-        self.mailbox = Mailbox()
+        self.mailbox = AgentRuntime.get_instance().mailbox
 
     @abstractmethod
     async def run(self, task: str) -> AgentResult:

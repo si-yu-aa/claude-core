@@ -1,8 +1,12 @@
 import pytest
+import asyncio
+import time
 from claude_core.agents.worker import WorkerAgent
 from claude_core.agents.types import AgentConfig, AgentStatus, AgentResult, ForkContext
+from claude_core.agents.runtime import AgentRuntime
 from claude_core.utils.abort import AbortController
-from claude_core.models.tool import QueryChainTracking
+from claude_core.models.tool import QueryChainTracking, ToolPermissionContext
+from claude_core.tasks.types import BackgroundTaskTracker, TaskStatus, TaskType, create_task_state
 
 @pytest.fixture
 def agent_config():
@@ -89,6 +93,28 @@ async def test_worker_agent_pause_resume(agent_config, parent_context):
     await agent.resume()
     assert agent.status == AgentStatus.RUNNING
 
+
+@pytest.mark.asyncio
+async def test_worker_agent_pause_does_not_abort_parent_context(agent_config, parent_context):
+    agent = WorkerAgent(config=agent_config, parent_context=parent_context)
+    agent.status = AgentStatus.RUNNING
+
+    await agent.pause()
+
+    assert agent.status == AgentStatus.PAUSED
+    assert parent_context.abort_controller.signal.aborted is False
+
+
+@pytest.mark.asyncio
+async def test_worker_agent_stop_does_not_abort_parent_context(agent_config, parent_context):
+    agent = WorkerAgent(config=agent_config, parent_context=parent_context)
+    agent.status = AgentStatus.RUNNING
+
+    await agent.stop()
+
+    assert agent.status == AgentStatus.STOPPED
+    assert parent_context.abort_controller.signal.aborted is False
+
 @pytest.mark.asyncio
 async def test_worker_agent_stop(agent_config, parent_context):
     agent = WorkerAgent(config=agent_config, parent_context=parent_context)
@@ -131,6 +157,28 @@ async def test_worker_agent_inherits_parent_api_config(agent_config, parent_cont
 
 
 @pytest.mark.asyncio
+async def test_worker_agent_inherits_provider_and_runtime_context(agent_config, parent_context):
+    parent_context.base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
+    parent_context.api_key = "gemini-key"
+    parent_context.options.mcp_clients = ["mcp-client"]
+    parent_context.options.permission_context = ToolPermissionContext(deny_rules=["bash:exec"])
+    parent_context.options.task_store_path = "/tmp/test-tasks.json"
+    parent_context.options.main_loop_model = "gemini-2.5-pro"
+    parent_context.provider = "gemini"
+
+    agent = WorkerAgent(config=agent_config, parent_context=parent_context)
+
+    assert agent.context.options.mcp_clients == ["mcp-client"]
+    assert agent.context.options.permission_context is parent_context.options.permission_context
+    assert agent.context.options.task_store_path == "/tmp/test-tasks.json"
+
+    engine_config = agent._create_engine_config()
+    assert engine_config.provider == "gemini"
+    assert engine_config.base_url == "https://generativelanguage.googleapis.com/v1beta/openai"
+    assert engine_config.api_key == "gemini-key"
+
+
+@pytest.mark.asyncio
 async def test_worker_agent_start_background_returns_agent_id(agent_config, parent_context):
     """Test that start_background returns the agent_id without blocking."""
     agent = WorkerAgent(config=agent_config, parent_context=parent_context)
@@ -142,6 +190,135 @@ async def test_worker_agent_start_background_returns_agent_id(agent_config, pare
 
     # Clean up
     await agent.stop()
+
+
+@pytest.mark.asyncio
+async def test_worker_agent_background_processes_mailbox_messages(agent_config, parent_context, monkeypatch):
+    runtime = AgentRuntime.get_instance()
+    runtime.clear()
+    submitted_prompts = []
+
+    class FakeEngine:
+        def __init__(self, config):
+            self.config = config
+
+        def set_system_prompt(self, prompt):
+            self.prompt = prompt
+
+        def set_tools(self, tools):
+            self.tools = tools
+
+        def set_tool_use_context(self, context):
+            self.context = context
+
+        def set_can_use_tool(self, can_use_tool):
+            self.can_use_tool = can_use_tool
+
+        async def submit_message(self, prompt):
+            submitted_prompts.append(prompt)
+            yield {"type": "content", "content": f"done:{prompt}"}
+
+        def stop(self):
+            return None
+
+    monkeypatch.setattr("claude_core.agents.worker.QueryEngine", FakeEngine)
+
+    agent = WorkerAgent(config=agent_config, parent_context=parent_context)
+    await agent.start_background("initial task")
+
+    runtime.mailbox.send("lead", agent.agent_id, "follow-up task")
+    await asyncio.sleep(0.2)
+    await agent.stop()
+
+    assert submitted_prompts[:2] == ["initial task", "follow-up task"]
+
+
+@pytest.mark.asyncio
+async def test_worker_agent_background_pause_resume_keeps_task_alive(agent_config, parent_context, monkeypatch):
+    runtime = AgentRuntime.get_instance()
+    runtime.clear()
+    submitted_prompts = []
+
+    class FakeEngine:
+        def __init__(self, config):
+            self.config = config
+
+        def set_system_prompt(self, prompt):
+            self.prompt = prompt
+
+        def set_tools(self, tools):
+            self.tools = tools
+
+        def set_tool_use_context(self, context):
+            self.context = context
+
+        def set_can_use_tool(self, can_use_tool):
+            self.can_use_tool = can_use_tool
+
+        async def submit_message(self, prompt):
+            submitted_prompts.append(prompt)
+            yield {"type": "content", "content": f"done:{prompt}"}
+
+        def stop(self):
+            return None
+
+    monkeypatch.setattr("claude_core.agents.worker.QueryEngine", FakeEngine)
+
+    agent = WorkerAgent(config=agent_config, parent_context=parent_context)
+    await agent.start_background("initial task")
+    await asyncio.sleep(0.1)
+
+    await agent.pause()
+    assert agent.status == AgentStatus.PAUSED
+    assert agent._background_task is not None
+    assert agent._background_task.done() is False
+    assert parent_context.abort_controller.signal.aborted is False
+
+    await agent.resume_background()
+    runtime.mailbox.send("lead", agent.agent_id, "resumed task")
+    await asyncio.sleep(0.2)
+    await agent.stop()
+
+    assert submitted_prompts[:2] == ["initial task", "resumed task"]
+
+
+@pytest.mark.asyncio
+async def test_worker_agent_stop_waits_for_background_task_to_finish(agent_config, parent_context, monkeypatch):
+    release = asyncio.Event()
+
+    class FakeEngine:
+        def __init__(self, config):
+            self.config = config
+
+        def set_system_prompt(self, prompt):
+            self.prompt = prompt
+
+        def set_tools(self, tools):
+            self.tools = tools
+
+        def set_tool_use_context(self, context):
+            self.context = context
+
+        def set_can_use_tool(self, can_use_tool):
+            self.can_use_tool = can_use_tool
+
+        async def submit_message(self, prompt):
+            yield {"type": "content", "content": f"done:{prompt}"}
+
+        def stop(self):
+            release.set()
+
+    monkeypatch.setattr("claude_core.agents.worker.QueryEngine", FakeEngine)
+
+    agent = WorkerAgent(config=agent_config, parent_context=parent_context)
+    await agent.start_background("initial task")
+    await asyncio.sleep(0.1)
+
+    await agent.stop()
+
+    assert agent.status == AgentStatus.STOPPED
+    assert agent._background_task is not None
+    assert agent._background_task.done() is True
 
 
 @pytest.mark.asyncio
@@ -186,6 +363,7 @@ async def test_worker_agent_resume_background_paused(agent_config, parent_contex
     # Resume should transition back to running
     await agent.resume_background()
     assert agent.status == AgentStatus.RUNNING
+    assert parent_context.abort_controller.signal.aborted is False
 
     # Clean up
     await agent.stop()
@@ -226,6 +404,165 @@ async def test_worker_agent_resume_background_idle_raises(agent_config, parent_c
     # Resume should raise RuntimeError since not started
     with pytest.raises(RuntimeError, match="has not been started"):
         await agent.resume_background()
+
+
+@pytest.mark.asyncio
+async def test_worker_agent_run_sets_completed_status(agent_config, parent_context, monkeypatch):
+    class FakeEngine:
+        def __init__(self, config):
+            self.config = config
+
+        def set_system_prompt(self, prompt):
+            self.prompt = prompt
+
+        def set_tools(self, tools):
+            self.tools = tools
+
+        def set_tool_use_context(self, context):
+            self.context = context
+
+        async def submit_message(self, prompt):
+            yield {"type": "content", "content": "completed"}
+
+        def stop(self):
+            return None
+
+    monkeypatch.setattr("claude_core.agents.worker.QueryEngine", FakeEngine)
+
+    agent = WorkerAgent(config=agent_config, parent_context=parent_context)
+    result = await agent.run("finish work")
+
+    assert result.status == AgentStatus.COMPLETED
+    assert agent.status == AgentStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_worker_agent_run_unregisters_completed_agent(agent_config, parent_context, monkeypatch):
+    runtime = AgentRuntime.get_instance()
+    runtime.clear()
+
+    class FakeEngine:
+        def __init__(self, config):
+            self.config = config
+
+        def set_system_prompt(self, prompt):
+            self.prompt = prompt
+
+        def set_tools(self, tools):
+            self.tools = tools
+
+        def set_tool_use_context(self, context):
+            self.context = context
+
+        async def submit_message(self, prompt):
+            yield {"type": "content", "content": "done"}
+
+        def stop(self):
+            return None
+
+    monkeypatch.setattr("claude_core.agents.worker.QueryEngine", FakeEngine)
+
+    agent = WorkerAgent(config=agent_config, parent_context=parent_context)
+    await agent.run("finish work")
+
+    assert runtime.get_agent(agent.agent_id) is None
+
+
+@pytest.mark.asyncio
+async def test_worker_agent_stop_cleans_runtime_and_tracker_state(agent_config, parent_context, monkeypatch):
+    runtime = AgentRuntime.get_instance()
+    runtime.clear()
+    tracker = BackgroundTaskTracker.get_instance()
+    tracker.clear()
+
+    class FakeEngine:
+        def __init__(self, config):
+            self.config = config
+
+        def set_system_prompt(self, prompt):
+            self.prompt = prompt
+
+        def set_tools(self, tools):
+            self.tools = tools
+
+        def set_tool_use_context(self, context):
+            self.context = context
+
+        def set_can_use_tool(self, can_use_tool):
+            self.can_use_tool = can_use_tool
+
+        async def submit_message(self, prompt):
+            yield {"type": "content", "content": f"done:{prompt}"}
+
+        def stop(self):
+            return None
+
+    monkeypatch.setattr("claude_core.agents.worker.QueryEngine", FakeEngine)
+
+    agent = WorkerAgent(config=agent_config, parent_context=parent_context)
+    state = create_task_state(
+        task_type=TaskType.BACKGROUND_AGENT,
+        subject="Long task",
+        description="worker cleanup",
+        agent_id=agent.agent_id,
+        agent_name="worker",
+        model="gpt-4o",
+        is_backgrounded=True,
+    )
+    state.status = TaskStatus.RUNNING.value
+    state.started_at = time.time()
+    tracker.add_state(state)
+
+    await agent.start_background("initial task")
+    await agent.stop()
+
+    assert runtime.get_agent(agent.agent_id) is None
+    assert tracker.get_task(agent.agent_id) is None
+    assert state.status == AgentStatus.STOPPED.value
+    assert state.completed_at is not None
+
+
+@pytest.mark.asyncio
+async def test_worker_agent_parent_abort_stops_background_and_cleans_runtime(
+    agent_config,
+    parent_context,
+    monkeypatch,
+):
+    runtime = AgentRuntime.get_instance()
+    runtime.clear()
+
+    class FakeEngine:
+        def __init__(self, config):
+            self.config = config
+
+        def set_system_prompt(self, prompt):
+            self.prompt = prompt
+
+        def set_tools(self, tools):
+            self.tools = tools
+
+        def set_tool_use_context(self, context):
+            self.context = context
+
+        def set_can_use_tool(self, can_use_tool):
+            self.can_use_tool = can_use_tool
+
+        async def submit_message(self, prompt):
+            yield {"type": "content", "content": f"done:{prompt}"}
+
+        def stop(self):
+            return None
+
+    monkeypatch.setattr("claude_core.agents.worker.QueryEngine", FakeEngine)
+
+    agent = WorkerAgent(config=agent_config, parent_context=parent_context)
+    await agent.start_background("initial task")
+
+    parent_context.abort_controller.abort("user_stop")
+    await asyncio.wait_for(agent._background_task, timeout=1.0)
+
+    assert agent.status == AgentStatus.STOPPED
+    assert runtime.get_agent(agent.agent_id) is None
 
 
 @pytest.mark.asyncio

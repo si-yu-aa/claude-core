@@ -11,6 +11,7 @@ async def test_client_initialization():
     )
     assert client.base_url == "https://api.openai.com/v1"
     assert client.model == "gpt-4o"
+    assert client.provider_name == "openai"
 
 @pytest.mark.asyncio
 async def test_client_strips_trailing_slash():
@@ -20,6 +21,27 @@ async def test_client_strips_trailing_slash():
     )
     assert client.base_url == "https://api.openai.com/v1"
     assert not client.base_url.endswith("/")
+
+
+@pytest.mark.asyncio
+async def test_client_uses_provider_default_base_url():
+    client = LLMClient(
+        base_url=None,
+        api_key="test-key",
+        provider="gemini",
+    )
+    assert "generativelanguage.googleapis.com" in client.base_url
+    assert client.provider_name == "gemini"
+
+
+@pytest.mark.asyncio
+async def test_client_builds_provider_specific_url():
+    client = LLMClient(
+        base_url=None,
+        api_key="test-key",
+        provider="gemini",
+    )
+    assert client._build_chat_completions_url().endswith("/chat/completions")
 
 def test_api_error_class():
     error = APIError(

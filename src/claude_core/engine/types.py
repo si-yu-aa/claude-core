@@ -41,7 +41,7 @@ class QueryState:
     max_output_tokens_override: Optional[int] = None
     pending_tool_use_summary: Optional[Any] = None
     stop_hook_active: Optional[bool] = None
-    turn_count: int = 1
+    turn_count: int = 0
     transition: Optional[Continue | Stop] = None
 
 @dataclass

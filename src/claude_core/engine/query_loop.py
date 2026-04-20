@@ -38,10 +38,38 @@ class BufferedToolCall:
     arguments: str = ""
 
 
+def _flush_buffered_tool_calls(
+    buffered_tool_calls: dict[int, BufferedToolCall],
+) -> list[ToolUseEvent]:
+    """Convert buffered streaming tool calls into tool use events."""
+    events: list[ToolUseEvent] = []
+    for index in sorted(buffered_tool_calls):
+        buffered_tool_call = buffered_tool_calls[index]
+        if not buffered_tool_call.id:
+            continue
+
+        try:
+            tool_input = json.loads(buffered_tool_call.arguments or "{}")
+        except json.JSONDecodeError:
+            tool_input = {}
+
+        events.append(
+            ToolUseEvent(
+                tool_use_id=buffered_tool_call.id,
+                name=buffered_tool_call.name,
+                input=tool_input,
+            )
+        )
+
+    buffered_tool_calls.clear()
+    return events
+
+
 async def call_model(
     client: LLMClient,
     messages: list[MessageParam],
     system_prompt: str,
+    model: str | None = None,
     tools: list | None = None,
     max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
     abort_controller: AbortController | None = None,
@@ -72,20 +100,20 @@ async def call_model(
     usage_recorded = False
 
     # Buffer for streaming tool calls
-    buffered_tool_call: Optional[BufferedToolCall] = None
+    buffered_tool_calls: dict[int, BufferedToolCall] = {}
 
     try:
         async with client._client.stream(
             "POST",
-            f"{client.base_url}/chat/completions",
+            client._build_chat_completions_url(),
             headers=client._build_headers(),
-            json={
-                "model": client.model,
-                "messages": formatted_messages,
-                "stream": True,
-                "max_tokens": max_tokens,
-                **({"tools": tools} if tools else {}),
-            },
+            json=client._build_request_body(
+                model=model or client.model,
+                messages=formatted_messages,
+                tools=tools,
+                stream=True,
+                max_tokens=max_tokens,
+            ),
         ) as response:
             async for line in response.aiter_lines():
                 if abort_controller and abort_controller.signal.aborted:
@@ -98,20 +126,8 @@ async def call_model(
                 if line.startswith("data: "):
                     data = line[6:]
                     if data == "[DONE]":
-                        # Yield any remaining buffered tool call
-                        if buffered_tool_call and buffered_tool_call.id:
-                            try:
-                                yield ToolUseEvent(
-                                    tool_use_id=buffered_tool_call.id,
-                                    name=buffered_tool_call.name,
-                                    input=json.loads(buffered_tool_call.arguments or "{}"),
-                                )
-                            except json.JSONDecodeError:
-                                yield ToolUseEvent(
-                                    tool_use_id=buffered_tool_call.id,
-                                    name=buffered_tool_call.name,
-                                    input={},
-                                )
+                        for event in _flush_buffered_tool_calls(buffered_tool_calls):
+                            yield event
                         # Yield usage at end of stream
                         if not usage_recorded:
                             yield {
@@ -148,8 +164,8 @@ async def call_model(
                             # Tool use - buffer the streaming arguments
                             if delta.get("tool_calls"):
                                 for tc in delta["tool_calls"]:
-                                    if buffered_tool_call is None:
-                                        buffered_tool_call = BufferedToolCall()
+                                    tc_index = tc.get("index", 0)
+                                    buffered_tool_call = buffered_tool_calls.setdefault(tc_index, BufferedToolCall())
 
                                     # Update tool call info
                                     if tc.get("id"):
@@ -161,22 +177,8 @@ async def call_model(
 
                             # Finish reason
                             if choice.get("finish_reason"):
-                                # Yield buffered tool call if present
-                                if buffered_tool_call and buffered_tool_call.id:
-                                    try:
-                                        yield ToolUseEvent(
-                                            tool_use_id=buffered_tool_call.id,
-                                            name=buffered_tool_call.name,
-                                            input=json.loads(buffered_tool_call.arguments or "{}"),
-                                        )
-                                    except json.JSONDecodeError:
-                                        # Invalid JSON, return empty input
-                                        yield ToolUseEvent(
-                                            tool_use_id=buffered_tool_call.id,
-                                            name=buffered_tool_call.name,
-                                            input={},
-                                        )
-                                    buffered_tool_call = None
+                                for event in _flush_buffered_tool_calls(buffered_tool_calls):
+                                    yield event
 
                                 yield MessageStopEvent()
     except Exception as e:
@@ -236,12 +238,11 @@ async def query(
     current_max_tokens = params.max_output_tokens_override or DEFAULT_MAX_OUTPUT_TOKENS
 
     # Model fallback state
-    primary_model = params.fallback_model
-    current_model = None
+    current_model = client.model
 
     while True:
         # Check max turns
-        if params.max_turns and state.turn_count >= params.max_turns:
+        if params.max_turns is not None and state.turn_count >= params.max_turns:
             yield Stop(reason="max_turns")
             return
 
@@ -264,10 +265,6 @@ async def query(
                 "tokens_freed": result.tokens_freed,
                 "reason": "snip",
             }
-
-        # Determine which model to use
-        if current_model is None:
-            current_model = client.model if client else primary_model
 
         # Build system prompt with context
         system_content = params.system_prompt
@@ -319,6 +316,7 @@ async def query(
                 client,
                 api_messages,
                 system_content,
+                model=current_model,
                 tools=tools,
                 max_tokens=current_max_tokens,
                 abort_controller=state.tool_use_context.abort_controller if state.tool_use_context else None,
@@ -418,9 +416,10 @@ async def query(
 
         # If there are tool use blocks, execute them
         if tool_use_blocks:
-            assistant_message = type('obj', (object,), {
-                "uuid": generate_uuid(),
-                "message": {
+            assistant_message = AssistantMessage(
+                uuid=generate_uuid(),
+                message={
+                    "role": "assistant",
                     "content": [
                         {
                             "type": "tool_use",
@@ -429,9 +428,10 @@ async def query(
                             "input": tb["input"],
                         }
                         for tb in tool_use_blocks
-                    ]
+                    ],
                 },
-            })()
+            )
+            state.messages.append(assistant_message)
 
             # Yield tool use events
             for tb in tool_use_blocks:
@@ -463,9 +463,16 @@ async def query(
                 # Get results
                 async for update in executor.get_remaining_results():
                     if update.message:
+                        tool_use_id = ""
+                        if hasattr(update.message, "message"):
+                            for block in update.message.message.get("content", []):
+                                if isinstance(block, dict) and block.get("type") == "tool_result":
+                                    tool_use_id = block.get("tool_use_id", "")
+                                    if tool_use_id:
+                                        break
                         yield {
                             "type": "tool_result",
-                            "tool_use_id": update.message.message.get("tool_use_result", {}).get("tool_use_id", "") if hasattr(update.message, 'message') else "",
+                            "tool_use_id": tool_use_id,
                             "content": update.message.tool_use_result if hasattr(update.message, 'tool_use_result') else str(update.message),
                         }
                         state.messages.append(update.message)
