@@ -96,6 +96,17 @@ class ToolImpl:
         self._aliases = kwargs.get("aliases", [])
         self._search_hint = kwargs.get("search_hint")
         self._max_result_size_chars = kwargs.get("max_result_size_chars")
+        for attr in (
+            "is_enabled",
+            "is_concurrency_safe",
+            "is_read_only",
+            "is_destructive",
+            "interrupt_behavior",
+            "validate_input",
+            "check_permissions",
+        ):
+            if attr in kwargs:
+                setattr(self, attr, kwargs[attr])
 
     async def validate_input(
         self,
